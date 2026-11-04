@@ -7,22 +7,17 @@ st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 �
 
 # KISA 가이드 기반 탐지 룰셋
 SENSITIVE_PATTERNS = [
-     {
+    {
         "name": "API 키 및 토큰 노출",
         "pattern": re.compile(r'(api[_-]?key|token|secret|password|passwd)\s*=\s*["\'][A-Za-z0-9_\-\.]+["\']', re.IGNORECASE),
         "guide": "[KISA 보안 가이드] 소스 코드 내에 API 키 또는 비밀번호가 평문으로 하드코딩되어 있습니다. 환경 변수(.env) 파일로 분리하여 관리하세요."
-
     },
-
-
     {
         "name": "SQL 인젝션 (문자열 직접 결합)",
         # SELECT, INSERT 등 뒤에 따옴표가 닫히고 '+' 기호나 f-string 변수가 곧바로 이어지는 위험한 형태 포착
         "pattern": re.compile(r'(SELECT|INSERT|UPDATE|DELETE)\s+.*?(["\']\s*[\+\%]\s*[a-zA-Z0-9_]+|f[\'"].*?\{)', re.IGNORECASE),
         "guide": "[KISA 보안 가이드] SQL 쿼리에 사용자 입력값이나 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 쿼리(PreparedStatement)를 사용하세요."
-    
     }
-
 ]
 
 uploaded_file = st.file_uploader("검사할 파일을 업로드하세요 (예: .py)", type=["py", "txt", "js"])
@@ -57,4 +52,4 @@ if uploaded_file is not None:
         else:
             st.error(f"총 {detected_count}개의 보안 취약점이 발견되었습니다. 조치 가이드에 따라 코드를 수정하세요.")
 else:
-    st.info("💡 검사할 소스 코드 파일을 업로드해주세요.")
+    st.info("검사할 소스 코드 파일을 업로드해주세요.")
