@@ -41,7 +41,7 @@ if uploaded_file is not None:
         
         for line_num, line in enumerate(lines, 1):
             for rule in SENSITIVE_PATTERNS:
-                if re.search(rule["pattern"], line, re.IGNORECASE):
+                if re.search(rule["pattern"], line):
                     detected_count += 1
                     with st.expander(f"[취약점 발견] {rule['name']} ({line_num}번째 줄)"):
                         st.code(line.strip(), language="python")
