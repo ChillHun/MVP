@@ -7,7 +7,7 @@ DATABASE_USER = "admin"
 # 위험: 해커가 노릴 수 있는 하드코딩된 비밀번호와 API Key
 password = "SuperSecretPassword123"
 api_key = "sk-ant-api03-abcdef1234567890"
-password = "1234"
+passwd = "1234"
 
 
 user_input = "admin' OR '1'='1"
