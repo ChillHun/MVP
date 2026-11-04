@@ -2,7 +2,7 @@ import streamlit as st
 import re
 
 # 웹 페이지 제목 설정
-st.title("팀 박지훈: AI 코딩 보안 스캐너")
+st.title("AI 코딩 보안 스캐너")
 st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 즉시 진단하고 KISA 가이드에 따른 한국어 조치 방법을 확인하세요.")
 
 # 샘플 파일 다운로드 기능 추가
