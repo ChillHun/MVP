@@ -5,6 +5,25 @@ import re
 st.title("팀 박지훈: AI 코딩 보안 스캐너")
 st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 즉시 진단하고 KISA 가이드에 따른 한국어 조치 방법을 확인하세요.")
 
+# 샘플 파일 다운로드 기능 추가
+st.markdown("### 테스트용 샘플 파일")
+st.write("스캔 기능을 테스트해보고 싶다면 아래 버튼을 눌러 샘플 코드를 다운로드하여 업로드해 보세요.")
+
+try:
+    with open("test.py", "rb") as f:
+        sample_code = f.read()
+    
+    st.download_button(
+        label="샘플 파일(test.py) 다운로드",
+        data=sample_code,
+        file_name="test.py",
+        mime="text/x-python"
+    )
+except FileNotFoundError:
+    st.caption("※ 저장소에 test.py 파일이 배치되면 다운로드 버튼이 활성화됩니다.")
+
+st.write("---")
+
 # KISA 가이드 기반 탐지 룰셋
 SENSITIVE_PATTERNS = [
     {
