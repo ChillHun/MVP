@@ -49,58 +49,36 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-# 주석 제거 및 멀티라인 문자열(HTML 템플릿 등) 영역 오탐 방지 전처리 함수
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수 (가장 안전하고 단순한 버전)
 def remove_python_comments_and_docstrings(source_code):
     lines = source_code.splitlines()
     clean_lines_with_info = []
     
     in_docstring = False
     docstring_delim = ''
-    
-    in_multiline_string = False
-    multiline_delim = ''
 
     for orig_line_num, line in enumerate(lines, 1):
         stripped = line.strip()
         
-        # 1. 여러 줄 독스트링(문서 주석) 감지
-        if not in_docstring and not in_multiline_string:
+        # 1. 문서화 주석(독스트링) 시작/끝 감지
+        if not in_docstring:
             if stripped.startswith('"""') or stripped.startswith("'''"):
                 docstring_delim = stripped[:3]
                 if stripped.count(docstring_delim) < 2:
                     in_docstring = True
                 continue
         else:
-            if in_docstring and docstring_delim in line:
+            if docstring_delim in line:
                 in_docstring = False
             continue
             
         if in_docstring:
             continue
             
-        # 2. HTML 템플릿 등 여러 줄 문자열 대입문 내부 감지 (template = ''' ... ''')
-        if not in_multiline_string:
-            # 대입 기호(=)와 함께 여러 줄 따옴표가 시작되는 경우 감지
-            if re.search(r'=\s*([\'"]{3})', stripped):
-                match = re.search(r'([\'"]{3})', stripped)
-                if match:
-                    multiline_delim = match.group(1)
-                    # 한 줄 안에 시작과 끝이 동시에 끝나지 않는 경우에만 멀티라인 모드 진입
-                    if stripped.count(multiline_delim) < 2:
-                        in_multiline_string = True
-                        continue
-        else:
-            if multiline_delim in line:
-                in_multiline_string = False
-            continue
-            
-        if in_multiline_string:
-            continue
-            
-        # 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
+        # 2. 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
         line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
         
-        # 빈 줄이 아닐 경우에만 원본 줄 번호와 함께 저장
+        # 3. 빈 줄이 아닐 경우에만 원본 줄 번호와 함께 저장
         if line_without_comment.strip():
             clean_lines_with_info.append((orig_line_num, line_without_comment))
             
@@ -123,6 +101,10 @@ if uploaded_file is not None:
         detected_results = []
         
         for orig_line_num, line in clean_lines_with_info:
+            # HTML 템플릿 변수 선언부(<pre> 등 HTML 태그가 포함된 줄)는 오탐 방지를 위해 제외
+            if "<pre" in line or "</pre>" in line or "<form" in line or "<input" in line:
+                continue
+                
             for rule in SENSITIVE_PATTERNS:
                 if rule["pattern"].search(line):
                     detected_results.append({
