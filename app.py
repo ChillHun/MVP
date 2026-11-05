@@ -6,29 +6,25 @@ st.title("팀 SC: AI 코딩 보안 스캐너")
 st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 즉시 진단하고 KISA 가이드에 따른 조치 방법을 제공합니다.")
 
 st.markdown("---")
-st.subheader("테스트 파일 다운로드 및 미리보기")
-st.write("스캐너 진단 테스트를 위한 샘플 파일(test.py)입니다. 파일을 다운로드하거나 아래 미리보기를 통해 코드를 확인하세요.")
 
-target_test_file = "test.py"
-
-try:
-    with open(target_test_file, "r", encoding="utf-8") as f:
-        file_content = f.read()
-    
-    st.download_button(
-        label="테스트 파일(test.py) 다운로드",
-        data=file_content,
-        file_name=target_test_file,
-        mime="text/plain"
-    )
-
-    with st.expander("연동된 test.py 코드 미리보기"):
-        st.code(file_content, language="python")
-
-except FileNotFoundError:
-    st.warning(f"경고: '{target_test_file}' 파일이 동일한 폴더에 존재하지 않습니다. test.py 파일을 생성해 주세요.")
-
-st.markdown("---")
+# KISA 가이드 기반 취약점 탐지 룰셋
+SENSITIVE_PATTERNS = [
+    {
+        "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
+        "pattern": re.compile(r'(execute|query)\s*\(.*?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?[''"]\s*\+', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
+    },
+    {
+        "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
+        "pattern": re.compile(r'(execute|query)\s*\(\s*f?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?(\{.*?\}|\%s)', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
+    },
+    {
+        "name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
+        "pattern": re.compile(r'\b(eval|exec)\s*\(', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] 외부 입력값이 검증 없이 eval() 또는 exec() 함수에 전달되면 임의의 코드가 실행될 수 있습니다. 사전 검증(isalnum 등)을 거치거나 해당 함수 사용을 금지하세요."
+    }
+]
 
 # 주석 제거 및 원본 줄 번호 추적 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
@@ -56,7 +52,7 @@ def remove_python_comments_and_docstrings(source_code):
         if in_docstring:
             continue
             
-        # 2. 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
+        # 2. 인라인 주석(# 이후 내용) 제거
         line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
         
         # 3. 빈 줄이 아닐 경우에만 원본 줄 번호와 함께 저장
@@ -65,9 +61,11 @@ def remove_python_comments_and_docstrings(source_code):
             
     return clean_lines_with_info
 
+# 파일 업로드 인터페이스
 uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"])
 
 if uploaded_file is not None:
+    # 업로드된 파일의 바이트를 텍스트로 안전하게 변환
     file_bytes = uploaded_file.read()
     code_text = file_bytes.decode("utf-8")
     
@@ -86,9 +84,8 @@ if uploaded_file is not None:
             if any(tag in line for tag in ["<pre", "</pre>", "<form", "<input", "<hr"]):
                 continue
             
-            # [규칙 1] SQL 실행 구문(execute 등)이 포함된 라인 검사
+            # [규칙 1] SQL 실행 구문(execute 등) 검사
             if re.search(r'\bexecute\s*\(', line, re.IGNORECASE):
-                # f-string 이나 문자열 포맷팅, 직접 변수 결합(+)이 포함되어 있는지 확인
                 if 'f"' in line or "f'" in line or "%s" in line or "+" in line or "{" in line:
                     detected_results.append({
                         "line_num": orig_line_num,
