@@ -50,7 +50,7 @@ SENSITIVE_PATTERNS = [
 
 # 주석 제거 및 원본 줄 번호 추적 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
-    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
+    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', lambda m: '\n' * m.group(0).count('\n'), source_code, flags=re.DOTALL)
     
     clean_lines_with_info = []
     for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
