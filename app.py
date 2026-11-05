@@ -30,25 +30,6 @@ except FileNotFoundError:
 
 st.markdown("---")
 
-# KISA 가이드 기반 취약점 탐지 룰셋 (실무 쿼리 실행 패턴 완벽 대응)
-SENSITIVE_PATTERNS = [
-    {
-        "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
-        "pattern": re.compile(r'(execute|query)\s*\(.*?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?[''"]\s*\+', re.IGNORECASE),
-        "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
-    },
-    {
-        "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
-        "pattern": re.compile(r'(execute|query)\s*\(\s*f?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?(\{.*?\}|\%s)', re.IGNORECASE),
-        "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
-    },
-    {
-        "name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
-        "pattern": re.compile(r'\b(eval|exec)\s*\(', re.IGNORECASE),
-        "guide": "[KISA 보안 가이드] 외부 입력값이 검증 없이 eval() 또는 exec() 함수에 전달되면 임의의 코드가 실행될 수 있습니다. 사전 검증(isalnum 등)을 거치거나 해당 함수 사용을 금지하세요."
-    }
-]
-
 # 주석 제거 및 원본 줄 번호 추적 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
     lines = source_code.splitlines()
@@ -102,23 +83,40 @@ if uploaded_file is not None:
         
         for orig_line_num, line in clean_lines_with_info:
             # HTML 템플릿 변수 선언부(<pre> 등 HTML 태그가 포함된 줄)는 오탐 방지를 위해 제외
-            if "<pre" in line or "</pre>" in line or "<form" in line or "<input" in line:
+            if any(tag in line for tag in ["<pre", "</pre>", "<form", "<input", "<hr"]):
                 continue
-                
-            for rule in SENSITIVE_PATTERNS:
-                if rule["pattern"].search(line):
+            
+            # [규칙 1] SQL 실행 구문(execute 등)이 포함된 라인 검사
+            if re.search(r'\bexecute\s*\(', line, re.IGNORECASE):
+                # f-string 이나 문자열 포맷팅, 직접 변수 결합(+)이 포함되어 있는지 확인
+                if 'f"' in line or "f'" in line or "%s" in line or "+" in line or "{" in line:
                     detected_results.append({
                         "line_num": orig_line_num,
                         "line_content": line,
-                        "rule_name": rule["name"],
-                        "guide": rule["guide"]
+                        "rule_name": "SQL 인젝션 (취약한 쿼리 파라미터 결합)",
+                        "guide": "[KISA 보안 가이드] SQL 쿼리 실행문 내에 변수 결합(f-string, 포맷팅, 연산)이 포함되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
                     })
+            
+            # [규칙 2] 코드 삽입 취약점 (eval/exec) 검사
+            if re.search(r'\b(eval|exec)\s*\(', line, re.IGNORECASE):
+                detected_results.append({
+                    "line_num": orig_line_num,
+                    "line_content": line,
+                    "rule_name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
+                    "guide": "[KISA 보안 가이드] 외부 입력값이 검증 없이 eval() 또는 exec() 함수에 전달되면 임의의 코드가 실행될 수 있습니다. 사전 검증(isalnum 등)을 거치거나 해당 함수 사용을 금지하세요."
+                })
         
-        # 줄 번호 기준으로 오름차순 정렬
-        detected_results = sorted(detected_results, key=lambda x: x["line_num"])
-        detected_count = len(detected_results)
+        # 줄 번호 기준으로 오름차순 정렬 및 중복 제거
+        seen_lines = set()
+        unique_results = []
+        for res in sorted(detected_results, key=lambda x: x["line_num"]):
+            if res["line_num"] not in seen_lines:
+                seen_lines.add(res["line_num"])
+                unique_results.append(res)
         
-        for res in detected_results:
+        detected_count = len(unique_results)
+        
+        for res in unique_results:
             with st.expander(f"[취약점 발견] {res['rule_name']} (원본 코드 {res['line_num']}번째 줄)"):
                 st.code(res['line_content'].strip(), language="python")
                 st.error(f"조치 가이드: {res['guide']}")
