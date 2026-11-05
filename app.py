@@ -22,8 +22,7 @@ try:
         mime="text/plain"
     )
 
-    with st.expander("연동된 test.py 코드 미리보기"):
-        st.code(file_content, language="python")
+    with st.expander("연동된 test.py 코드 미리보기"): st.code(file_content, language="python")
 
 except FileNotFoundError:
     st.warning(f"경고: '{target_test_file}' 파일이 동일한 폴더에 존재하지 않습니다. test.py 파일을 생성해 주세요.")
@@ -49,7 +48,8 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-# [핵심] 상태 스위치 방식을 통한 정확한 줄 번호 추적 및 전처리 함수
+
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수 (상태 스위치 방식 적용)
 def remove_python_comments_and_docstrings(source_code):
     lines = source_code.splitlines()
     clean_lines_with_info = []
@@ -60,9 +60,10 @@ def remove_python_comments_and_docstrings(source_code):
     for orig_line_num, line in enumerate(lines, 1):
         stripped = line.strip()
         
-        # 1. 문서화 주석(독스트링) 시작/끝 상태 스위치 감지
+        # [수정 포인트] 1. 문서화 주석(독스트링) 시작/끝 상태 스위치 감지 
+        # (변수 대입 형태인 template = ''' 등은 주석으로 오인하지 않도록 and '=' not in line 추가)
         if not in_docstring:
-            if stripped.startswith('"""') or stripped.startswith("'''"):
+            if (stripped.startswith('"""') or stripped.startswith("'''")) and '=' not in line:
                 docstring_delim = stripped[:3]
                 # 한 줄 안에 독스트링이 열리고 닫히지 않은 경우에만 스위치 ON
                 if stripped.count(docstring_delim) < 2:
@@ -86,7 +87,6 @@ def remove_python_comments_and_docstrings(source_code):
             
     return clean_lines_with_info
 
-# 파일 업로드 인터페이스
 uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"])
 
 if uploaded_file is not None:
@@ -104,10 +104,6 @@ if uploaded_file is not None:
         detected_count = 0
         
         for orig_line_num, line in clean_lines_with_info:
-            # HTML 템플릿 변수 대입부(<pre> 등 HTML 태그가 포함된 라인)는 오탐 방지를 위해 스킵
-            if any(tag in line for tag in ["<pre", "</pre>", "<form", "<input", "template ="]):
-                continue
-                
             for rule in SENSITIVE_PATTERNS:
                 if rule["pattern"].search(line):
                     detected_count += 1
