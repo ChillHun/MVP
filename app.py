@@ -30,40 +30,37 @@ except FileNotFoundError:
 
 st.markdown("---")
 
-# 멀티라인 및 줄바꿈을 완벽히 대응하는 통합 탐지 함수
+# 멀티라인 및 단일 라인 모두 완벽 대응하는 초강력 탐지 함수
 def scan_vulnerabilities(source_code):
     detected_results = []
     lines = source_code.splitlines()
     
-    # 1. 멀티라인 SQL 실행문 탐지 (줄바꿈이 되어 있어도 execute( 부터 닫히는 괄호까지 통째로 병합하여 분석)
-    # 파이썬 전체 코드에서 execute(...) 블록을 찾아냄
-    execute_pattern = re.compile(r'\b(?:cursor|cur|db|conn)?\.?execute\s*\((.*?)\)', re.DOTALL | re.IGNORECASE)
+    # 전체 텍스트에서 execute(...) 블록을 강력하게 추출
+    # 줄바꿈이 있든 없든 execute( 로 시작해서 닫히는 괄호 ) 까지 통째로 수집
+    execute_pattern = re.compile(r'(?:cursor|cur|db|conn)?\.?execute\s*\(.*?\)', re.DOTALL | re.IGNORECASE)
     
     for match in execute_pattern.finditer(source_code):
-        exec_content = match.group(1)
-        # 해당 내용이 시작되는 대략적인 줄 번호 계산
+        block_content = match.group(0)
         start_pos = match.start()
         line_num = source_code[:start_pos].count('\n') + 1
         
-        # 쿼리 내부에 취약한 요소(f-string, 변수 + 연산, % 포맷팅)가 포함되어 있는지 검사
-        if 'f"' in exec_content or "f'" in exec_content or "%s" in exec_content or "+" in exec_content or re.search(r'\{.*?\}', exec_content):
-            # 전체 매칭된 블록을 한 줄 또는 깔끔한 형태로 정리
-            full_matched_snippet = match.group(0).strip()
+        # 쿼리 실행문 내부에 취약한 문자열 결합 방식이 포함되어 있는지 직관적으로 검사
+        if 'f"' in block_content or "f'" in block_content or "%s" in block_content or "+" in block_content or "{" in block_content:
             detected_results.append({
                 "line_num": line_num,
-                "line_content": full_matched_snippet,
-                "rule_name": "SQL 인젝션 (f-string 및 변수 결합 쿼리)",
+                "line_content": block_content.strip(),
+                "rule_name": "SQL 인젝션 (취약한 쿼리 파라미터 결합)",
                 "guide": "[KISA 보안 가이드] SQL 쿼리 실행문 내에 변수 결합(f-string, 포맷팅, 연산)이 포함되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
             })
 
-    # 2. 개별 라인 기반 탐지 (eval / exec 코드 삽입 취약점)
+    # 개별 라인 기반 eval / exec 코드 삽입 취약점 탐지
     in_docstring = False
     docstring_delim = ''
     
     for orig_line_num, line in enumerate(lines, 1):
         stripped = line.strip()
         
-        # 독스트링(문서 주석) 스킵 처리
+        # 독스트링 스킵
         if not in_docstring:
             if stripped.startswith('"""') or stripped.startswith("'''"):
                 docstring_delim = stripped[:3]
@@ -80,7 +77,6 @@ def scan_vulnerabilities(source_code):
         # 인라인 주석 제거
         line_no_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
         
-        # eval / exec 감지
         if re.search(r'\b(eval|exec)\s*\(', line_no_comment, re.IGNORECASE):
             detected_results.append({
                 "line_num": orig_line_num,
