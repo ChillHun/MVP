@@ -98,7 +98,7 @@ if uploaded_file is not None:
         # 정제된 코드 라인을 한 줄씩 순회하며 패턴 검사 수행
         for line_num, line in enumerate(clean_lines, 1):
             for rule in SENSITIVE_PATTERNS:
-                if re.search(rule["pattern"], line, re.IGNORECASE):
+                if rule["pattern"].search(line):
                     detected_count += 1
                     # 취약점 발견 시 확장 탭으로 문제 코드와 KISA 조치 가이드 출력
                     with st.expander(f"[취약점 발견] {rule['name']} ({line_num}번째 유효 코드 줄)"):
