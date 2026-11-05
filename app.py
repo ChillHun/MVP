@@ -30,16 +30,16 @@ except FileNotFoundError:
 
 st.markdown("---")
 
-# KISA 가이드 기반 취약점 탐지 룰셋
+# KISA 가이드 기반 취약점 탐지 룰셋 (실무 쿼리 실행 패턴 완벽 대응)
 SENSITIVE_PATTERNS = [
     {
         "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
-        "pattern": re.compile(r'(SELECT|INSERT|UPDATE|DELETE)\s+.*?\+\s*[a-zA-Z0-9_]+', re.IGNORECASE),
+        "pattern": re.compile(r'(execute|query)\s*\(.*?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?[''"]\s*\+', re.IGNORECASE),
         "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
     },
     {
         "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
-        "pattern": re.compile(r'(SELECT|INSERT|UPDATE|DELETE)\s+.*?f?["\'].*?(\{.*?\}|\%s)', re.IGNORECASE),
+        "pattern": re.compile(r'(execute|query)\s*\(\s*f?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?(\{.*?\}|\%s)', re.IGNORECASE),
         "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
     },
     {
@@ -49,7 +49,7 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-# 주석 제거 및 원본 줄 번호 추적 전처리 함수 (가장 안전하고 단순한 버전)
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
     lines = source_code.splitlines()
     clean_lines_with_info = []
