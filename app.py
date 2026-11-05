@@ -30,16 +30,16 @@ except FileNotFoundError:
 
 st.markdown("---")
 
-# KISA 가이드 기반 취약점 탐지 룰셋 (HTML 템플릿 오탐 방지 정교화)
+# KISA 가이드 기반 취약점 탐지 룰셋 (HTML 변수 제외 및 유연한 쿼리 탐지)
 SENSITIVE_PATTERNS = [
     {
         "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
-        "pattern": re.compile(r'(execute\s*\(|sql\s*=\s*|query\s*=\s*).*?(SELECT|INSERT|UPDATE|DELETE)\s+.*?\+\s*[a-zA-Z0-9_]+', re.IGNORECASE),
+        "pattern": re.compile(r'(SELECT|INSERT|UPDATE|DELETE)\s+.*?\+\s*[a-zA-Z0-9_]+', re.IGNORECASE),
         "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
     },
     {
         "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
-        "pattern": re.compile(r'(execute\s*\(|sql\s*=\s*|query\s*=\s*).*?f?["\'].*?(SELECT|INSERT|UPDATE|DELETE).*?(\{.*?\}|\%s)', re.IGNORECASE),
+        "pattern": re.compile(r'f["\'].*?(SELECT|INSERT|UPDATE|DELETE).*?(\{.*?\}|\%s)|(SELECT|INSERT|UPDATE|DELETE).*?%s', re.IGNORECASE),
         "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
     },
     {
@@ -102,6 +102,10 @@ if uploaded_file is not None:
         
         # 원본 줄 번호와 코드 라인을 순회하며 패턴 검사 수행
         for orig_line_num, line in clean_lines_with_info:
+            # HTML 템플릿 변수 선언부(<pre> 등 HTML 태그가 포함된 줄)는 오탐 방지를 위해 제외
+            if "<pre" in line or "</pre>" in line or "<form" in line:
+                continue
+                
             for rule in SENSITIVE_PATTERNS:
                 if rule["pattern"].search(line):
                     detected_results.append({
