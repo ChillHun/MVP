@@ -54,9 +54,11 @@ def remove_python_comments_and_docstrings(source_code):
     
     clean_lines_with_info = []
     for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
-        line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
-        if line_without_comment.strip():
-            clean_lines_with_info.append((orig_line_num, line_without_comment))
+       line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
+       if re.match(r'^\s*(["\'])[^"\']*\1\s*$', line_without_comment):  # 문자열만 있는 줄은 주석으로 보고 제외
+        continue
+       if line_without_comment.strip():
+        clean_lines_with_info.append((orig_line_num, line_without_comment))
             
     return clean_lines_with_info
 
