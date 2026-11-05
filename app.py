@@ -1,7 +1,6 @@
 import streamlit as st
 import re
 
-# 웹 페이지 제목 및 설명
 st.title("팀 SC: AI 코딩 보안 스캐너")
 st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 즉시 진단하고 KISA 가이드에 따른 조치 방법을 제공합니다.")
 
@@ -30,7 +29,6 @@ except FileNotFoundError:
 
 st.markdown("---")
 
-# KISA 가이드 기반 취약점 탐지 룰셋
 SENSITIVE_PATTERNS = [
     {
         "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
@@ -49,7 +47,6 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-# 주석 제거 및 원본 줄 번호 추적 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
     code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
     
@@ -75,15 +72,31 @@ if uploaded_file is not None:
         st.subheader("스캔 결과 리포트")
         
         clean_lines_with_info = remove_python_comments_and_docstrings(code_text)
-        detected_count = 0
         
+        # 발견된 취약점들을 순서대로 담아둘 리스트
+        detected_results = []
+        
+        # 코드 라인을 먼저 기준으로 순회하면서 규칙을 대조합니다.
         for orig_line_num, line in clean_lines_with_info:
             for rule in SENSITIVE_PATTERNS:
                 if rule["pattern"].search(line):
-                    detected_count += 1
-                    with st.expander(f"[취약점 발견] {rule['name']} (원본 코드 {orig_line_num}번째 줄)"):
-                        st.code(line.strip(), language="python")
-                        st.error(f"조치 가이드: {rule['guide']}")
+                    detected_results.append({
+                        "line_num": orig_line_num,
+                        "line_content": line,
+                        "rule_name": rule["name"],
+                        "guide": rule["guide"]
+                    })
+        
+        # 혹시 모를 순서 꼬임을 방지하기 위해 줄 번호(line_num) 기준으로 오름차순 정렬
+        detected_results = sorted(detected_results, key=lambda x: x["line_num"])
+        
+        detected_count = len(detected_results)
+        
+        # 정렬된 결과 리포트 출력
+        for res in detected_results:
+            with st.expander(f"[취약점 발견] {res['rule_name']} (원본 코드 {res['line_num']}번째 줄)"):
+                st.code(res['line_content'].strip(), language="python")
+                st.error(f"조치 가이드: {res['guide']}")
                         
         if detected_count == 0:
             st.success("안전: 업로드한 파일에서 주요 보안 취약점이 발견되지 않았습니다.")
