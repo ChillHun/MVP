@@ -22,7 +22,7 @@ try:
         mime="text/plain"
     )
 
-    with st.expander("연동된 test.py 코드 미리보기"):
+    with st.expander("연동된 test.py 코드 미리보기"):ㅁ
         st.code(file_content, language="python")
 
 except FileNotFoundError:
@@ -30,72 +30,37 @@ except FileNotFoundError:
 
 st.markdown("---")
 
-# 멀티라인 및 단일 라인 모두 완벽 대응하는 초강력 탐지 함수
-def scan_vulnerabilities(source_code):
-    detected_results = []
-    lines = source_code.splitlines()
-    
-    # 전체 텍스트에서 execute(...) 블록을 강력하게 추출
-    # 줄바꿈이 있든 없든 execute( 로 시작해서 닫히는 괄호 ) 까지 통째로 수집
-    execute_pattern = re.compile(r'(?:cursor|cur|db|conn)?\.?execute\s*\(.*?\)', re.DOTALL | re.IGNORECASE)
-    
-    for match in execute_pattern.finditer(source_code):
-        block_content = match.group(0)
-        start_pos = match.start()
-        line_num = source_code[:start_pos].count('\n') + 1
-        
-        # 쿼리 실행문 내부에 취약한 문자열 결합 방식이 포함되어 있는지 직관적으로 검사
-        if 'f"' in block_content or "f'" in block_content or "%s" in block_content or "+" in block_content or "{" in block_content:
-            detected_results.append({
-                "line_num": line_num,
-                "line_content": block_content.strip(),
-                "rule_name": "SQL 인젝션 (취약한 쿼리 파라미터 결합)",
-                "guide": "[KISA 보안 가이드] SQL 쿼리 실행문 내에 변수 결합(f-string, 포맷팅, 연산)이 포함되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
-            })
+# KISA 가이드 기반 취약점 탐지 룰셋
+SENSITIVE_PATTERNS = [
+    {
+        "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
+        "pattern": re.compile(r'(SELECT|INSERT|UPDATE|DELETE)\s+.*?\+\s*[a-zA-Z0-9_]+', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
+    },
+    {
+        "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
+        "pattern": re.compile(r'(SELECT|INSERT|UPDATE|DELETE)\s+.*?f?["\'].*?(\{.*?\}|\%s)', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
+    },
+    {
+        "name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
+        "pattern": re.compile(r'\b(eval|exec)\s*\(', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] 외부 입력값이 검증 없이 eval() 또는 exec() 함수에 전달되면 임의의 코드가 실행될 수 있습니다. 사전 검증(isalnum 등)을 거치거나 해당 함수 사용을 금지하세요."
+    }
+]
 
-    # 개별 라인 기반 eval / exec 코드 삽입 취약점 탐지
-    in_docstring = False
-    docstring_delim = ''
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수
+def remove_python_comments_and_docstrings(source_code):
+    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
     
-    for orig_line_num, line in enumerate(lines, 1):
-        stripped = line.strip()
-        
-        # 독스트링 스킵
-        if not in_docstring:
-            if stripped.startswith('"""') or stripped.startswith("'''"):
-                docstring_delim = stripped[:3]
-                if stripped.count(docstring_delim) < 2:
-                    in_docstring = True
-                continue
-        else:
-            if docstring_delim in line:
-                in_docstring = False
-            continue
-        if in_docstring:
-            continue
+    clean_lines_with_info = []
+    for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
+        line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
+        if line_without_comment.strip():
+            clean_lines_with_info.append((orig_line_num, line_without_comment))
             
-        # 인라인 주석 제거
-        line_no_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
-        
-        if re.search(r'\b(eval|exec)\s*\(', line_no_comment, re.IGNORECASE):
-            detected_results.append({
-                "line_num": orig_line_num,
-                "line_content": line_no_comment.strip(),
-                "rule_name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
-                "guide": "[KISA 보안 가이드] 외부 입력값이 검증 없이 eval() 또는 exec() 함수에 전달되면 임의의 코드가 실행될 수 있습니다. 사전 검증(isalnum 등)을 거치거나 해당 함수 사용을 금지하세요."
-            })
+    return clean_lines_with_info
 
-    # 줄 번호 순 정렬 및 중복 제거
-    seen_lines = set()
-    unique_results = []
-    for res in sorted(detected_results, key=lambda x: x["line_num"]):
-        if res["line_num"] not in seen_lines:
-            seen_lines.add(res["line_num"])
-            unique_results.append(res)
-            
-    return unique_results
-
-# 파일 업로드 인터페이스
 uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"])
 
 if uploaded_file is not None:
@@ -109,13 +74,16 @@ if uploaded_file is not None:
         st.write("---")
         st.subheader("스캔 결과 리포트")
         
-        unique_results = scan_vulnerabilities(code_text)
-        detected_count = len(unique_results)
+        clean_lines_with_info = remove_python_comments_and_docstrings(code_text)
+        detected_count = 0
         
-        for res in unique_results:
-            with st.expander(f"[취약점 발견] {res['rule_name']} (원본 코드 {res['line_num']}번째 줄)"):
-                st.code(res['line_content'], language="python")
-                st.error(f"조치 가이드: {res['guide']}")
+        for orig_line_num, line in clean_lines_with_info:
+            for rule in SENSITIVE_PATTERNS:
+                if rule["pattern"].search(line):
+                    detected_count += 1
+                    with st.expander(f"[취약점 발견] {rule['name']} (원본 코드 {orig_line_num}번째 줄)"):
+                        st.code(line.strip(), language="python")
+                        st.error(f"조치 가이드: {rule['guide']}")
                         
         if detected_count == 0:
             st.success("안전: 업로드한 파일에서 주요 보안 취약점이 발견되지 않았습니다.")
