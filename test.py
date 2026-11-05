@@ -1,27 +1,32 @@
-# 타겟 파일
-import sqlite3
+# [테스트용 파이썬 샘플 파일]
+from django.shortcuts import render
+from django.db import connection
 
-DATABASE_HOST = "localhost"
-DATABASE_USER = "admin"
-
-# 위험: 해커가 노릴 수 있는 하드코딩된 비밀번호와 API Key
-password = "SuperSecretPassword123"
-api_key = "sk-ant-api03-abcdef1234567890"
-passwd = "1234"
-
-
-user_input = "admin' OR '1'='1"
-
-# [테스트 1: 위험한 코드] - 문자열 직접 결합
-sql_vulnerable = "SELECT * FROM users WHERE user_id = '" + user_input + "'"
-# 또는 f-string 형태의 취약한 결합
-sql_vulnerable_2 = f"SELECT * FROM boards WHERE title = '{user_input}'"
-
-
-# [테스트 2: 안전한 코드] - 파라미터 바인딩 사용 
-db_cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_input,))
-
-
-
-def connect_db():
-    print("Connecting...")
+def vulnerable_test_view(request):
+    dbconn = connection
+    
+    with dbconn.cursor() as curs:
+        # 1. 외부 입력값 가져오기
+        name = request.POST.get('name', '')
+        user_id = request.POST.get('user_id', '')
+        message = request.POST.get('message', '')
+        
+        # ----------------------------------------------------
+        # [테스트 1] SQL 인젝션: 문자열 덧셈(+) 연산 결합 취약점
+        # ----------------------------------------------------
+        sql_query_1 = "update board set name=" + name + " where content_id=1"
+        curs.execute(sql_query_1)
+        
+        # ----------------------------------------------------
+        # [테스트 2] SQL 인젝션: f-string 및 포맷팅 결합 취약점
+        # ----------------------------------------------------
+        sql_query_2 = f"SELECT * FROM users WHERE id = '{user_id}'"
+        curs.execute(sql_query_2)
+        
+        # ----------------------------------------------------
+        # [테스트 3] 코드 삽입(Code Injection): 위험한 eval() 함수 사용
+        # ----------------------------------------------------
+        # 검증 없이 사용자 입력을 eval()에 바로 전달
+        ret = eval(message)
+        
+    return render(request, 'success.html', {'data': ret})
