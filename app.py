@@ -1,6 +1,7 @@
 import streamlit as st
 import re
 
+# 웹 페이지 제목 및 설명
 st.title("팀 SC: AI 코딩 보안 스캐너")
 st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 즉시 진단하고 KISA 가이드에 따른 조치 방법을 제공합니다.")
 
@@ -29,6 +30,7 @@ except FileNotFoundError:
 
 st.markdown("---")
 
+# KISA 가이드 기반 취약점 탐지 룰셋
 SENSITIVE_PATTERNS = [
     {
         "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
@@ -47,12 +49,36 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수 (HTML 템플릿 변수 엉킴 방지 적용)
 def remove_python_comments_and_docstrings(source_code):
-    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
-    
+    lines = source_code.splitlines()
     clean_lines_with_info = []
-    for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
+    
+    in_docstring = False
+    docstring_delim = ''
+
+    for orig_line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+        
+        # 여러 줄 독스트링(문서 주석) 시작/끝 감지 및 필터링
+        if not in_docstring:
+            if stripped.startswith('"""') or stripped.startswith("'''"):
+                docstring_delim = stripped[:3]
+                if stripped.count(docstring_delim) < 2:
+                    in_docstring = True
+                continue
+        else:
+            if docstring_delim in line:
+                in_docstring = False
+            continue
+            
+        if in_docstring:
+            continue
+            
+        # 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
         line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
+        
+        # 빈 줄이 아닐 경우에만 원본 줄 번호와 함께 저장
         if line_without_comment.strip():
             clean_lines_with_info.append((orig_line_num, line_without_comment))
             
@@ -72,11 +98,9 @@ if uploaded_file is not None:
         st.subheader("스캔 결과 리포트")
         
         clean_lines_with_info = remove_python_comments_and_docstrings(code_text)
-        
-        # 발견된 취약점들을 순서대로 담아둘 리스트
         detected_results = []
         
-        # 코드 라인을 먼저 기준으로 순회하면서 규칙을 대조합니다.
+        # 원본 줄 번호와 코드 라인을 순회하며 패턴 검사 수행
         for orig_line_num, line in clean_lines_with_info:
             for rule in SENSITIVE_PATTERNS:
                 if rule["pattern"].search(line):
@@ -87,12 +111,10 @@ if uploaded_file is not None:
                         "guide": rule["guide"]
                     })
         
-        # 혹시 모를 순서 꼬임을 방지하기 위해 줄 번호(line_num) 기준으로 오름차순 정렬
+        # 줄 번호(line_num) 기준으로 오름차순 정렬
         detected_results = sorted(detected_results, key=lambda x: x["line_num"])
-        
         detected_count = len(detected_results)
         
-        # 정렬된 결과 리포트 출력
         for res in detected_results:
             with st.expander(f"[취약점 발견] {res['rule_name']} (원본 코드 {res['line_num']}번째 줄)"):
                 st.code(res['line_content'].strip(), language="python")
