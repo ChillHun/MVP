@@ -6,18 +6,41 @@ st.title("팀 SC: AI 코딩 보안 스캐너")
 st.write("바이브 코딩 후 놓치기 쉬운 보안 취약점을 웹에서 즉시 진단하고 KISA 가이드에 따른 조치 방법을 제공합니다.")
 
 st.markdown("---")
+st.subheader("테스트 파일 다운로드 및 미리보기")
+st.write("스캐너 진단 테스트를 위한 샘플 파일(test.py)입니다. 파일을 다운로드하거나 아래 미리보기를 통해 코드를 확인하세요.")
 
-# KISA 가이드 기반 취약점 탐지 룰셋
+target_test_file = "test.py"
+
+try:
+    with open(target_test_file, "r", encoding="utf-8") as f:
+        file_content = f.read()
+    
+    st.download_button(
+        label="테스트 파일(test.py) 다운로드",
+        data=file_content,
+        file_name=target_test_file,
+        mime="text/plain"
+    )
+
+    with st.expander("연동된 test.py 코드 미리보기"):
+        st.code(file_content, language="python")
+
+except FileNotFoundError:
+    st.warning(f"경고: '{target_test_file}' 파일이 동일한 폴더에 존재하지 않습니다. test.py 파일을 생성해 주세요.")
+
+st.markdown("---")
+
+# KISA 가이드 기반 취약점 탐지 룰셋 (실무 쿼리 실행 패턴 완벽 대응)
 SENSITIVE_PATTERNS = [
     {
-        "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
-        "pattern": re.compile(r'(execute|query)\s*\(.*?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?[''"]\s*\+', re.IGNORECASE),
-        "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
+        "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
+        "pattern": re.compile(r'execute\s*\(\s*f?["\'].*?(\{.*?\}|\%s)', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
     },
     {
-        "name": "SQL 인젝션 (f-string 및 포맷팅 결합)",
-        "pattern": re.compile(r'(execute|query)\s*\(\s*f?[''"].*?(SELECT|INSERT|UPDATE|DELETE).*?(\{.*?\}|\%s)', re.IGNORECASE),
-        "guide": "[KISA 보안 가이드] SQL 쿼리에 f-string이나 포맷팅 기호가 포함되어 있습니다. 인자화된 쿼리와 바인딩 인자를 분리하여 사용하세요."
+        "name": "SQL 인젝션 (문자열 + 연산 쿼리 결합)",
+        "pattern": re.compile(r'execute\s*\(.*?["\'].*?["\']\s*\+', re.IGNORECASE),
+        "guide": "[KISA 보안 가이드] SQL 쿼리에 변수가 문자열 연산(+)으로 직접 결합되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
     },
     {
         "name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
@@ -65,7 +88,6 @@ def remove_python_comments_and_docstrings(source_code):
 uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"])
 
 if uploaded_file is not None:
-    # 업로드된 파일의 바이트를 텍스트로 안전하게 변환
     file_bytes = uploaded_file.read()
     code_text = file_bytes.decode("utf-8")
     
@@ -80,28 +102,19 @@ if uploaded_file is not None:
         detected_results = []
         
         for orig_line_num, line in clean_lines_with_info:
-            # HTML 템플릿 변수 선언부(<pre> 등 HTML 태그가 포함된 줄)는 오탐 방지를 위해 제외
-            if any(tag in line for tag in ["<pre", "</pre>", "<form", "<input", "<hr"]):
+            # HTML 템플릿 변수 선언부 내부에 포함된 태그 라인은 오탐 방지를 위해 스킵하되, 
+            # 실제 cur.execute가 포함된 핵심 실행문은 절대 놓치지 않도록 조건 조정
+            if any(tag in line for tag in ["<pre style", "</pre>", "<form>"]) and "execute" not in line:
                 continue
-            
-            # [규칙 1] SQL 실행 구문(execute 등) 검사
-            if re.search(r'\bexecute\s*\(', line, re.IGNORECASE):
-                if 'f"' in line or "f'" in line or "%s" in line or "+" in line or "{" in line:
+                
+            for rule in SENSITIVE_PATTERNS:
+                if rule["pattern"].search(line):
                     detected_results.append({
                         "line_num": orig_line_num,
                         "line_content": line,
-                        "rule_name": "SQL 인젝션 (취약한 쿼리 파라미터 결합)",
-                        "guide": "[KISA 보안 가이드] SQL 쿼리 실행문 내에 변수 결합(f-string, 포맷팅, 연산)이 포함되어 있습니다. 파라미터 바인딩 방식을 사용하세요."
+                        "rule_name": rule["name"],
+                        "guide": rule["guide"]
                     })
-            
-            # [규칙 2] 코드 삽입 취약점 (eval/exec) 검사
-            if re.search(r'\b(eval|exec)\s*\(', line, re.IGNORECASE):
-                detected_results.append({
-                    "line_num": orig_line_num,
-                    "line_content": line,
-                    "rule_name": "코드 삽입 취약점 (위험한 eval/exec 함수 사용)",
-                    "guide": "[KISA 보안 가이드] 외부 입력값이 검증 없이 eval() 또는 exec() 함수에 전달되면 임의의 코드가 실행될 수 있습니다. 사전 검증(isalnum 등)을 거치거나 해당 함수 사용을 금지하세요."
-                })
         
         # 줄 번호 기준으로 오름차순 정렬 및 중복 제거
         seen_lines = set()
