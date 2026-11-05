@@ -49,13 +49,36 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-# 주석 제거 및 원본 줄 번호 추적 전처리 함수
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수 (HTML 템플릿 따옴표 엉킴 방지 완벽 해결)
 def remove_python_comments_and_docstrings(source_code):
-    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
-    
+    lines = source_code.splitlines()
     clean_lines_with_info = []
-    for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
+    
+    in_docstring = False
+    docstring_delim = ''
+
+    for orig_line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+        
+        # 여러 줄 독스트링 시작/끝 감지
+        if not in_docstring:
+            if stripped.startswith('"""') or stripped.startswith("'''"):
+                docstring_delim = stripped[:3]
+                if stripped.count(docstring_delim) < 2:
+                    in_docstring = True
+                continue
+        else:
+            if docstring_delim in line:
+                in_docstring = False
+            continue
+            
+        if in_docstring:
+            continue
+            
+        # 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
         line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
+        
+        # 빈 줄이 아닐 경우에만 원본 줄 번호와 함께 저장
         if line_without_comment.strip():
             clean_lines_with_info.append((orig_line_num, line_without_comment))
             
