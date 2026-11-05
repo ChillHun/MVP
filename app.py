@@ -22,8 +22,7 @@ try:
         mime="text/plain"
     )
 
-    with st.expander("연동된 test.py 코드 미리보기"):ㅁ
-        st.code(file_content, language="python")
+    with st.expander("연동된 test.py 코드 미리보기"): st.code(file_content, language="python")
 
 except FileNotFoundError:
     st.warning(f"경고: '{target_test_file}' 파일이 동일한 폴더에 존재하지 않습니다. test.py 파일을 생성해 주세요.")
