@@ -48,40 +48,13 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-
-# 주석 제거 및 원본 줄 번호 추적 전처리 함수 (상태 스위치 방식 적용)
+# 주석 제거 및 원본 줄 번호 추적 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
-    lines = source_code.splitlines()
-    clean_lines_with_info = []
+    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
     
-    in_docstring = False
-    docstring_delim = ''
-
-    for orig_line_num, line in enumerate(lines, 1):
-        stripped = line.strip()
-        
-        # [수정 포인트] 1. 문서화 주석(독스트링) 시작/끝 상태 스위치 감지 
-        # (변수 대입 형태인 template = ''' 등은 주석으로 오인하지 않도록 and '=' not in line 추가)
-        if not in_docstring:
-            if (stripped.startswith('"""') or stripped.startswith("'''")) and '=' not in line:
-                docstring_delim = stripped[:3]
-                # 한 줄 안에 독스트링이 열리고 닫히지 않은 경우에만 스위치 ON
-                if stripped.count(docstring_delim) < 2:
-                    in_docstring = True
-                continue
-        else:
-            # 독스트링이 끝나는 기호가 나오면 스위치 OFF
-            if docstring_delim in line:
-                in_docstring = False
-            continue
-            
-        if in_docstring:
-            continue
-            
-        # 2. 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
+    clean_lines_with_info = []
+    for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
         line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
-        
-        # 3. 빈 줄이 아닐 경우에만 [원본 줄 번호]와 함께 저장
         if line_without_comment.strip():
             clean_lines_with_info.append((orig_line_num, line_without_comment))
             
