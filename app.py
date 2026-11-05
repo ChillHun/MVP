@@ -22,7 +22,8 @@ try:
         mime="text/plain"
     )
 
-    with st.expander("연동된 test.py 코드 미리보기"): st.code(file_content, language="python")
+    with st.expander("연동된 test.py 코드 미리보기"):
+        st.code(file_content, language="python")
 
 except FileNotFoundError:
     st.warning(f"경고: '{target_test_file}' 파일이 동일한 폴더에 존재하지 않습니다. test.py 파일을 생성해 주세요.")
@@ -48,18 +49,44 @@ SENSITIVE_PATTERNS = [
     }
 ]
 
-# 주석 제거 및 원본 줄 번호 추적 전처리 함수
+# [핵심] 상태 스위치 방식을 통한 정확한 줄 번호 추적 및 전처리 함수
 def remove_python_comments_and_docstrings(source_code):
-    code_no_docstrings = re.sub(r'(""".*?"""|\'\'\'.*?\'\'\')', '', source_code, flags=re.DOTALL)
-    
+    lines = source_code.splitlines()
     clean_lines_with_info = []
-    for orig_line_num, line in enumerate(code_no_docstrings.splitlines(), 1):
+    
+    in_docstring = False
+    docstring_delim = ''
+
+    for orig_line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+        
+        # 1. 문서화 주석(독스트링) 시작/끝 상태 스위치 감지
+        if not in_docstring:
+            if stripped.startswith('"""') or stripped.startswith("'''"):
+                docstring_delim = stripped[:3]
+                # 한 줄 안에 독스트링이 열리고 닫히지 않은 경우에만 스위치 ON
+                if stripped.count(docstring_delim) < 2:
+                    in_docstring = True
+                continue
+        else:
+            # 독스트링이 끝나는 기호가 나오면 스위치 OFF
+            if docstring_delim in line:
+                in_docstring = False
+            continue
+            
+        if in_docstring:
+            continue
+            
+        # 2. 인라인 주석(# 이후 내용) 제거 (문자열 내부의 # 보호)
         line_without_comment = re.sub(r'(?<!["\'])\s*#.*$', '', line)
+        
+        # 3. 빈 줄이 아닐 경우에만 [원본 줄 번호]와 함께 저장
         if line_without_comment.strip():
             clean_lines_with_info.append((orig_line_num, line_without_comment))
             
     return clean_lines_with_info
 
+# 파일 업로드 인터페이스
 uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"])
 
 if uploaded_file is not None:
@@ -77,6 +104,10 @@ if uploaded_file is not None:
         detected_count = 0
         
         for orig_line_num, line in clean_lines_with_info:
+            # HTML 템플릿 변수 대입부(<pre> 등 HTML 태그가 포함된 라인)는 오탐 방지를 위해 스킵
+            if any(tag in line for tag in ["<pre", "</pre>", "<form", "<input", "template ="]):
+                continue
+                
             for rule in SENSITIVE_PATTERNS:
                 if rule["pattern"].search(line):
                     detected_count += 1
