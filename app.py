@@ -11,7 +11,7 @@ import streamlit as st
 SQL_KW = re.compile(r'\b(?:SELECT\b.*\bFROM|INSERT\b.*\bINTO|UPDATE\b.*\bSET|DELETE\b.*\bFROM)\b', re.IGNORECASE | re.DOTALL)
 # 이름 '끝'이 비밀값 단어여야 함 (password_label, token_url 같은 이름은 제외)
 SECRET_NAME = re.compile(
-    r'(?:^|_)(?:password|passwd|pwd|passphrase|secret|secret_key|api_key|apikey|access_key|'
+    r'(?:^|_)(?:password|passwd|pwd|pw|passphrase|secret|secret_key|api_key|apikey|access_key|'
     r'private_key|auth_key|authenticate_key|token|access_token|auth_token|refresh_token)$',
     re.IGNORECASE)
 LDAP_FILTER = re.compile(r'\(\s*[&|!]?\s*\(?\s*[A-Za-z][\w.-]*\s*[~<>]?=')
@@ -39,6 +39,7 @@ GUIDES = {
     "취약한 해시 알고리즘": "[KISA 보안 가이드 2-4] md5/sha1은 취약합니다. sha256 이상을 사용하세요.",
     "취약한 암호화 알고리즘": "[KISA 보안 가이드 2-4] DES/RC2/RC4/Blowfish 등은 취약합니다. AES, ARIA, SEED 등 검증된 알고리즘을 사용하세요.",
     "하드코딩된 중요정보": "[KISA 보안 가이드 2-6] 비밀번호/키가 소스에 하드코딩되어 있습니다. 환경변수나 암호화된 별도 설정 파일을 사용하세요.",
+    "중요정보 노출(로그/출력)": "[보안 권고] 비밀번호/토큰/키 값을 print 또는 로그로 출력합니다. 콘솔·로그 파일은 여러 사람이 보거나 외부로 수집될 수 있으므로 중요정보는 출력하지 말고, 필요하면 마스킹(****)하세요.",
     "충분하지 않은 키 길이": "[KISA 보안 가이드 2-7] 키 길이가 짧습니다. RSA/DSA는 2048비트 이상, ECC는 224비트 이상을 사용하세요.",
     "적절하지 않은 난수 값": "[KISA 보안 가이드 2-8] 보안 용도(OTP, 토큰, 세션키 등)에 random 모듈을 사용합니다. secrets 모듈을 사용하세요.",
     "SSL 검증 비활성화": "[KISA 보안 가이드 2-11] 인증서 검증을 끄면 중간자 공격에 노출됩니다. PROTOCOL_TLS_CLIENT / verify=True로 인증서를 검증하세요.",
@@ -57,7 +58,9 @@ GUIDES = {
 SQL_EXEC_FUNCS = {"execute", "executemany", "executescript", "raw", "read_sql", "read_sql_query"}
 # 외부 입력으로 간주하는 request 속성 (request.method 등은 제외)
 REQUEST_ATTRS = {"GET", "POST", "FILES", "COOKIES", "META", "body", "data", "form", "args", "values",
-                 "json", "get_json", "files", "cookies", "headers", "query_params", "path_params"}
+                 "json", "get_json", "files", "cookies", "headers", "query_params", "path_params", "referrer"}
+ENV_GET_FUNCS = {"os.environ.get", "os.getenv", "os.environ.setdefault"}
+LOG_METHODS = {"debug", "info", "warning", "warn", "error", "critical", "exception", "log"}
 # 웹 프레임워크 경로 함수: @app.get("/x"), @router.post(...), @app.route("/<name>") 의 매개변수 = 외부 입력
 ROUTE_DECORATORS = {"get", "post", "put", "delete", "patch", "head", "options", "route", "api_route",
                     "websocket", "api_view"}
@@ -199,6 +202,28 @@ def _secret_literal(node):
     if re.fullmatch(r'[A-Z][A-Z0-9_]*', v):   # 'DB_PASSWORD' 같은 환경변수 이름
         return False
     return True
+
+
+def _output_names(node):
+    """출력되는 값 자체의 이름들. print(f"{user.password}") -> ['password']
+    함수 호출 결과(len(password), hash(pw) 등)는 원래 값이 아니므로 제외 (str/repr 은 그대로 출력되므로 포함)"""
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.Attribute):
+        return [node.attr]
+    if isinstance(node, ast.Subscript):
+        return [node.slice.value] if _is_str_const(node.slice) else []
+    if isinstance(node, ast.FormattedValue):
+        return _output_names(node.value)
+    if isinstance(node, ast.JoinedStr):
+        return [n for v in node.values for n in _output_names(v)]
+    if isinstance(node, ast.BinOp):
+        return _output_names(node.left) + _output_names(node.right)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [n for e in node.elts for n in _output_names(e)]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "repr", "format"):
+        return [n for a in node.args for n in _output_names(a)]
+    return []
 
 
 def _name_tokens(name):
@@ -806,6 +831,24 @@ class SecurityVisitor(ast.NodeVisitor):
             if k.arg and SECRET_NAME.search(k.arg) and _secret_literal(k.value):
                 self.report("하드코딩된 중요정보", k.value, single_line=True)
 
+        # 환경변수 기본값으로 하드코딩된 비밀값: os.environ.get("ADMIN_PASSWORD", "admin1234")
+        if name in ENV_GET_FUNCS and _is_str_const(first):
+            default = args[1] if len(args) > 1 else kw.get("default")
+            secret_named = SECRET_NAME.search(first.value) or any(SECRET_NAME.search(n) for n in self.assign_names)
+            if secret_named and _secret_literal(default):
+                self.report("하드코딩된 중요정보", node,
+                            f"환경변수 {first.value} 가 없으면 소스에 적힌 기본값이 그대로 비밀번호/키로 사용됩니다.")
+
+        # 중요정보 출력: print(password) / logger.info(f"token={token}")
+        is_log = (builtin and name == "print") or (
+            short in LOG_METHODS and isinstance(node.func, ast.Attribute)
+            and "log" in _raw_name(node.func.value).lower())
+        if is_log:
+            leaked = sorted({n for a in list(args) + [k.value for k in node.keywords]
+                             for n in _output_names(a) if SECRET_NAME.search(n)})
+            if leaked:
+                self.report("중요정보 노출(로그/출력)", node, f"출력되는 값: {', '.join(leaked)}")
+
         self.generic_visit(node)
 
     def _check_key_length(self, node, name, short, first, kw):
@@ -940,7 +983,8 @@ SKIP_DIRS = {"venv", ".venv", "env", ".env", "__pycache__", "site-packages", "di
 
 
 def _is_skipped(path):
-    parts = path.replace("\\", "/").split("/")[:-1]   # 마지막은 파일명
+    # 첫 번째는 사용자가 고른 폴더 자신(이름이 build, env 여도 검사), 마지막은 파일명
+    parts = path.replace("\\", "/").split("/")[1:-1]
     return any(p in SKIP_DIRS for p in parts)
 
 
