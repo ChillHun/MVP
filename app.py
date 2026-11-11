@@ -1,7 +1,10 @@
 import ast
+import base64
 import builtins
 import csv
 import io
+import json
+import math
 import re
 import textwrap
 import tokenize
@@ -47,7 +50,9 @@ GUIDES = {
     "취약한 해시 알고리즘": "[KISA 보안 가이드 2-4] md5/sha1은 취약합니다. sha256 이상을 사용하세요.",
     "취약한 암호화 알고리즘": "[KISA 보안 가이드 2-4] DES/RC2/RC4/Blowfish 등은 취약합니다. AES, ARIA, SEED 등 검증된 알고리즘을 사용하세요.",
     "하드코딩된 중요정보": "[KISA 보안 가이드 2-6] 비밀번호/키가 소스에 하드코딩되어 있습니다. 환경변수나 암호화된 별도 설정 파일을 사용하세요.",
-    "중요정보 노출(로그/출력)": "[보안 권고] 비밀번호/토큰/키 값을 print 또는 로그로 출력합니다. 콘솔·로그 파일은 여러 사람이 보거나 외부로 수집될 수 있으므로 중요정보는 출력하지 말고, 필요하면 마스킹(****)하세요.",
+    "API 키·비밀값 노출": "[KISA 보안 가이드 2-6] 서비스 API 키/비밀값이 파일에 그대로 들어 있습니다. GitHub 등에 이미 올렸다면 코드에서 지워도 기록에 남으므로, 해당 서비스 관리 화면에서 키를 즉시 폐기·재발급하세요. 새 키는 .env 같은 환경변수 파일에 두고 .env 는 .gitignore 에 추가하세요.",
+    ".env 파일 포함": "[KISA 보안 가이드 2-6 관련] .env 파일이 프로젝트에 들어 있는데 .gitignore 에서 제외되어 있지 않습니다. 이대로 GitHub에 올리면 안의 키가 모두 공개됩니다. .gitignore 에 .env 를 추가하고, 이미 올렸다면 안의 키를 모두 재발급하세요.",
+    "중요정보 노출(로그/출력)": "[KISA 보안 가이드 2-5 관련] 비밀번호/토큰/키 값을 print 또는 로그로 출력합니다. 콘솔·로그 파일은 여러 사람이 보거나 외부로 수집될 수 있으므로 중요정보는 출력하지 말고, 필요하면 마스킹(****)하세요.",
     "충분하지 않은 키 길이": "[KISA 보안 가이드 2-7] 키 길이가 짧습니다. RSA/DSA는 2048비트 이상, ECC는 224비트 이상을 사용하세요.",
     "적절하지 않은 난수 값": "[KISA 보안 가이드 2-8] 보안 용도(OTP, 토큰, 세션키 등)에 random 모듈을 사용합니다. secrets 모듈을 사용하세요.",
     "SSL 검증 비활성화": "[KISA 보안 가이드 2-11] 인증서 검증을 끄면 중간자 공격에 노출됩니다. PROTOCOL_TLS_CLIENT / verify=True로 인증서를 검증하세요.",
@@ -895,6 +900,283 @@ def scan_source(source):
     return findings, None
 
 
+# ================= API 키 / 비밀값 유출 검사 (모든 텍스트 파일) =================
+# 서비스별 키 형식 일부는 gitleaks 규칙(MIT License, Copyright (c) 2019 Zachary Rice)을 참고함.
+# 라이선스 전문: THIRD_PARTY_NOTICES.md
+SECRET_RULE = "API 키·비밀값 노출"
+ENV_FILE_RULE = ".env 파일 포함"
+SEVERITY_ORDER = {"높음": 3, "중간": 2, "낮음": 1}
+
+# (서비스 이름, 위험도, 정규식, 같은 줄에 있어야 하는 단어 또는 None, 추가 안내)
+# 정규식에 (?P<s>...) 그룹이 있으면 그 부분이 비밀값, 없으면 매칭 전체가 비밀값
+_PROVIDER_RULES = [
+    ("OpenAI API 키", "높음",
+     r'\bsk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})'
+     r'|\bsk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}', None, ""),
+    ("Anthropic API 키", "높음", r'\bsk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{93}AA', None, ""),
+    ("Google API 키", "중간", r'\bAIza[\w-]{35}', None,
+     "Gemini 등 서버용 키라면 즉시 재발급하세요. Firebase 웹 설정용 키라면 원래 공개되는 키이므로 콘솔에서 API 사용 제한을 걸어 두세요."),
+    ("Hugging Face 토큰", "중간", r'\bhf_[A-Za-z]{34}\b', None, ""),
+    ("Perplexity API 키", "높음", r'\bpplx-[A-Za-z0-9]{48}\b', None, ""),
+    ("AWS 액세스 키", "높음", r'\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b', None, ""),
+    ("GitHub 토큰", "높음", r'\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{36}\b|\bgithub_pat_\w{82}\b', None, ""),
+    ("npm 토큰", "중간", r'\bnpm_[A-Za-z0-9]{36}\b', None, ""),
+    ("PyPI 토큰", "중간", r'\bpypi-AgEIcHlwaS5vcmc[\w-]{50,1000}', None, ""),
+    ("Stripe 비밀 키(운영)", "높음", r'\b(?:sk|rk)_(?:live|prod)_[A-Za-z0-9]{10,99}\b', None, ""),
+    ("Stripe 비밀 키(테스트)", "낮음", r'\b(?:sk|rk)_test_[A-Za-z0-9]{10,99}\b', None, "테스트 키는 실제 결제가 일어나지 않지만, 운영 키도 같은 방식으로 다루고 있는지 확인하세요."),
+    ("토스페이먼츠 시크릿 키(운영)", "높음", r'\blive_g?sk_[A-Za-z0-9]{10,}', None, ""),
+    ("토스페이먼츠 시크릿 키(테스트)", "낮음", r'\btest_g?sk_[A-Za-z0-9]{10,}', None, "테스트 키는 실제 결제가 일어나지 않지만, 운영 키(live_sk)도 같은 방식으로 다루고 있는지 확인하세요."),
+    ("Supabase 비밀 키", "높음", r'\bsb_secret_[A-Za-z0-9_-]{20,}', None, "이 키는 DB 전체에 접근할 수 있습니다. 브라우저 코드에는 sb_publishable_ 키만 쓰세요."),
+    ("Slack 토큰", "중간", r'\bxox[bapsr]-[0-9A-Za-z-]{10,}', None, ""),
+    ("Slack 웹훅 주소", "중간", r'hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}', None, ""),
+    ("SendGrid API 키", "중간", r'\bSG\.[A-Za-z0-9=_.-]{66}\b', None, ""),
+    ("Notion API 토큰", "중간", r'\bntn_[0-9]{11}[A-Za-z0-9]{35}\b', None, ""),
+    ("Heroku API 키", "중간", r'\bHRKU-AA[0-9A-Za-z_-]{58}\b', None, ""),
+    ("Telegram 봇 토큰", "중간", r'\b[0-9]{5,16}:A[A-Za-z0-9_-]{34}\b', "telegr", ""),
+    ("Discord 토큰", "중간", r'\b[a-f0-9]{64}\b', "discord", ""),
+    ("개인키(Private Key)", "높음", r'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----', None,
+     "개인키 파일 내용이 들어 있습니다. 키 쌍을 새로 만들고 기존 키는 폐기하세요."),
+    ("DB 접속 비밀번호", "높음",
+     r'\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@\'"]+:(?P<s>[^\s@/\'"]+)@', None,
+     "접속 주소 안에 비밀번호가 들어 있습니다. DB 비밀번호를 바꾸고 접속 주소는 환경변수로 옮기세요."),
+]
+PROVIDER_RULES = [(n, sev, re.compile(rx), ctx, tip) for n, sev, rx, ctx, tip in _PROVIDER_RULES]
+
+JWT_RE = re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.(?P<p>eyJ[A-Za-z0-9_-]{10,})\.[A-Za-z0-9_-]{10,}')
+HEX32_RE = re.compile(r'(?<![0-9A-Za-z])[0-9a-f]{32}(?![0-9A-Za-z])')
+# 이름 = 값 / 이름: 값 / "이름": "값" (.env, YAML, JSON, JS 객체 등)
+ASSIGN_RE = re.compile(r'''(?P<name>[A-Za-z_][\w.-]*)["']?\s*(?::|=>|=)\s*(?P<q>["'`]?)(?P<val>[^\s"'`,;)}\]]+)''')
+NAVER_SECRET_RE = re.compile(r'''(?::|=)\s*["']?(?P<s>[A-Za-z]{10})["']?(?=\s|$|[,;)}\]])''')
+SERVICE_KEY_NAME = re.compile(r'service_?key', re.IGNORECASE)
+KAKAO_PUBLIC_HINTS = ("kakao.init", "javascript", "js_key", "jskey", "js_app_key", "dapi.kakao.com", "appkey=")
+
+PLACEHOLDER_WORDS = ("your", "example", "xxxx", "****", "...", "<", ">", "${", "{{", "%(", "process.env",
+                     "os.environ", "getenv", "env(", "placeholder", "dummy", "sample", "changeme", "change-me",
+                     "replace", "insert", "todo", "fixme")
+PLACEHOLDER_EXACT = {"password", "passwd", "secret", "token", "apikey", "api_key", "none", "null", "true",
+                     "false", "undefined", "test", "required", "optional", "string"}
+TEST_DIR_NAMES = {"test", "tests", "testing", "fixtures", "__tests__", "spec", "specs", "mocks"}
+CODE_EXTS = {"js", "jsx", "ts", "tsx", "mjs", "cjs", "vue", "svelte", "java", "kt", "go", "rb", "php",
+             "cs", "swift", "dart", "rs", "scala"}
+
+
+def _ext(path):
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[-1].lower() if "." in name.lstrip(".") else ""
+
+
+def _is_test_path(path):
+    parts = path.replace("\\", "/").lower().split("/")
+    return any(p in TEST_DIR_NAMES for p in parts[:-1]) or parts[-1].startswith("test_") \
+        or ".test." in parts[-1] or ".spec." in parts[-1]
+
+
+def _is_placeholder(val):
+    v = val.strip().strip("\"'`")
+    low = v.lower()
+    if low in PLACEHOLDER_EXACT or any(w in low for w in PLACEHOLDER_WORDS):
+        return True
+    return len(set(v)) <= 2   # xxxxxxxx, 00000000 같은 값
+
+
+def _entropy(s):
+    if not s:
+        return 0.0
+    counts = {c: s.count(c) for c in set(s)}
+    return -sum(n / len(s) * math.log2(n / len(s)) for n in counts.values())
+
+
+def mask_secret(val):
+    """sk-proj-Ab12****xY9z 처럼 앞뒤 일부만 남기고 가림"""
+    if len(val) <= 12:   # 짧은 키는 뒷부분도 숨김 (네이버 Secret 10자 등)
+        return val[:2] + "*" * 8
+    head = min(6, len(val) // 5)
+    return val[:head] + "*" * 8 + val[-4:]
+
+
+def _jwt_role(payload_b64):
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)))
+        return data.get("role") if isinstance(data, dict) else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _secret_hits(line, python, code_file, next_line=""):
+    """한 줄에서 찾은 비밀값 목록: [(서비스, 위험도, 비밀값, 추가 안내, 시작 위치, 끝 위치)]"""
+    hits = []
+    low = line.lower()
+
+    def add(name, sev, m, group, tip=""):
+        hits.append((name, sev, m.group(group), tip, m.start(group), m.end(group)))
+
+    for name, sev, rx, ctx, tip in PROVIDER_RULES:
+        if ctx and ctx not in low:
+            continue
+        for m in rx.finditer(line):
+            group = "s" if "s" in rx.groupindex else 0
+            if _is_placeholder(m.group(group)):
+                continue
+            if name.startswith("개인키"):
+                # 시작 표시 문자열만 있는 상수(코드 안의 마커)는 제외: 키 본문(base64)이 이어질 때만 탐지
+                after = line[m.end():] + "\n" + next_line
+                if not re.search(r'(?:^|\n|\n)\s*[A-Za-z0-9+/=]{40,}', after):
+                    continue
+            if name == "DB 접속 비밀번호" and re.search(r'@(?:localhost|127\.0\.0\.1|0\.0\.0\.0)\b', line[m.start():]):
+                sev, tip = "낮음", "내 컴퓨터(localhost)용 개발 주소로 보입니다. 운영 DB 주소에도 같은 비밀번호를 쓰고 있지 않은지 확인하세요."
+            add(name, sev, m, group, tip)
+
+    # Supabase 레거시 service_role 키 (JWT 안의 role 값으로 공개용 anon 키와 구분)
+    for m in JWT_RE.finditer(line):
+        if _jwt_role(m.group("p")) == "service_role":
+            add("Supabase service_role 키", "높음", m, 0,
+                "이 키는 DB 전체에 접근할 수 있습니다. 브라우저 코드에는 anon 키만 쓰세요.")
+
+    # 카카오: 32자리 16진수. 같은 줄에 kakao 가 있을 때만 (MD5 해시와 형식이 같기 때문)
+    if "kakao" in low and not any(h in low for h in KAKAO_PUBLIC_HINTS):
+        for m in HEX32_RE.finditer(line):
+            if "admin" in low:
+                add("카카오 어드민 키", "높음", m, 0, "어드민 키는 서버에서만 사용하고 소스 코드에 저장하지 마세요.")
+            else:
+                add("카카오 REST API 키", "중간", m, 0)
+
+    # 네이버 Client Secret: 영문 10자. 같은 줄에 naver 와 secret 이 있을 때만
+    if "naver" in low and "secret" in low:
+        for m in NAVER_SECRET_RE.finditer(line):
+            if not _is_placeholder(m.group("s")):
+                add("네이버 Client Secret", "중간", m, "s")
+
+    # 이름 기반: serviceKey(공공데이터포털 등), 그리고 .py 가 아닌 파일의 password= / api_key: 등
+    # 압축(minified)된 아주 긴 줄은 이름/값 구분이 무의미하므로 제외
+    if len(line) > 1000:
+        return hits
+    for m in ASSIGN_RE.finditer(line):
+        key = m.group("name").split(".")[-1]
+        val = m.group("val")
+        if code_file and not m.group("q"):
+            continue   # JS 등 코드 파일에서 따옴표 없는 값은 변수 참조 (req.body.password 등)
+        if any(h[2] == val for h in hits) or _is_placeholder(val):
+            continue
+        if SERVICE_KEY_NAME.search(key) and len(val) >= 20:
+            add("공공데이터포털 등 서비스 인증키(추정)", "중간", m, "val")
+        elif not python and _is_secret_name(key) and len(val) >= 6 and _entropy(val) >= 2.5:
+            add(f"'{key}' 값", "중간", m, "val")
+    return hits
+
+
+def _mask_line(line, hits):
+    """찾은 위치만 정확히 가림 (같은 글자가 다른 곳에 있어도 건드리지 않음)"""
+    spans = sorted({(h[4], h[5]) for h in hits}, reverse=True)
+    last = None
+    for start, end in spans:
+        if last is not None and end > last:   # 겹치는 구간은 한 번만
+            continue
+        line = line[:start] + mask_secret(line[start:end]) + line[end:]
+        last = start
+    return line
+
+
+def scan_secrets(text, path="", python=False):
+    """텍스트 파일에서 API 키/비밀값을 찾는다. 파이썬 파일은 이름 기반 일반 규칙을 빼고 실행
+    (하드코딩 일반 규칙은 파이썬 문법 분석기가 담당)."""
+    findings = []
+    code_file = _ext(path) in CODE_EXTS
+    in_test = _is_test_path(path)
+    lines = text.splitlines()
+    for ln, line in enumerate(lines, 1):
+        line = line[:5000]
+        next_line = lines[ln] if ln < len(lines) else ""
+        hits = _secret_hits(line, python, code_file, next_line[:5000])
+        if not hits:
+            continue
+        masked = _mask_line(line, hits).strip()
+        if len(masked) > 200:
+            masked = masked[:200] + " ..."
+        top = max(hits, key=lambda h: SEVERITY_ORDER[h[1]])
+        severity = "낮음" if in_test else top[1]
+        services = ", ".join(dict.fromkeys(h[0] for h in hits))
+        extra = f"탐지: {services} / 위험도: {severity}"
+        if in_test:
+            extra += " (테스트 폴더의 파일입니다. 실제 키가 아니라면 무시해도 됩니다)"
+        tips = [h[3] for h in hits if h[3]]
+        if tips:
+            extra += "\n" + tips[0]
+        findings.append({"rule": SECRET_RULE, "line": ln, "code": masked,
+                         "guide": GUIDES[SECRET_RULE], "extra": extra, "severity": severity})
+    return findings
+
+
+# ================= 파일 종류별 검사 =================
+TEXT_EXTS = {"env", "json", "yaml", "yml", "toml", "ini", "cfg", "conf", "properties", "ipynb",
+             "sh", "bash", "zsh", "ps1", "bat", "cmd", "txt", "md", "xml", "html", "htm", "sql",
+             "gradle", "tf", "tfvars", "npmrc", "pypirc", "netrc", "local", "development", "production",
+             "staging", "dev", "prod", "pem", "key", "p8", "ppk"} | CODE_EXTS
+TEXT_FILE_NAMES = {"dockerfile", ".npmrc", ".pypirc", ".netrc", ".env", "procfile"}
+SKIP_FILE_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "pipfile.lock",
+                   "composer.lock", "cargo.lock", "uv.lock"}
+ENV_EXAMPLE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+MAX_SCAN_BYTES = 1_000_000
+
+
+def _base_name(path):
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def file_kind(path):
+    """'python' / 'text' / None(검사 안 함)"""
+    name = _base_name(path).lower()
+    if name in SKIP_FILE_NAMES or name.endswith((".min.js", ".map")):
+        return None
+    if name.startswith(".env") and name.endswith(ENV_EXAMPLE_SUFFIXES):
+        return None   # .env.example 등 예시 파일
+    if name.endswith(".py"):
+        return "python"
+    if name in TEXT_FILE_NAMES or name.startswith(".env") or _ext(name) in TEXT_EXTS:
+        return "text"
+    return None
+
+
+def scan_file(path, raw):
+    """파일 1개 검사. 반환: (findings, 에러메시지 또는 None)"""
+    kind = file_kind(path)
+    if kind is None:
+        return [], None
+    if len(raw) > MAX_SCAN_BYTES:
+        return [], f"파일이 너무 커서 건너뛰었습니다 ({len(raw) // 1024}KB)"
+    if b"\x00" in raw[:8192]:
+        return [], None   # 바이너리 파일
+    text = _decode(raw)
+    if kind == "text":
+        return scan_secrets(text, path), None
+
+    findings, error = scan_source(text)
+    secrets = scan_secrets(text, path, python=True)
+    secret_lines = {f["line"] for f in secrets}
+    # 같은 줄을 '하드코딩된 중요정보'와 비밀값 검사가 함께 잡으면 더 구체적인 비밀값 검사 결과만 남김
+    findings = [f for f in findings if not (f["rule"] == "하드코딩된 중요정보" and f["line"] in secret_lines)]
+    return sorted(findings + secrets, key=lambda f: f["line"]), error
+
+
+def check_env_files(paths, gitignore_text):
+    """업로드한 폴더의 .env 파일이 .gitignore 로 제외되어 있는지 검사. 반환: {경로: finding}"""
+    ignored = False
+    for raw_line in (gitignore_text or "").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith(("#", "!")) and ".env" in line:
+            ignored = True
+    out = {}
+    if ignored:
+        return out
+    for p in paths:
+        name = _base_name(p).lower()
+        if name.startswith(".env") and not name.endswith(ENV_EXAMPLE_SUFFIXES):
+            out[p] = {"rule": ENV_FILE_RULE, "line": 1, "code": f"(파일 전체) {_base_name(p)}",
+                      "guide": GUIDES[ENV_FILE_RULE], "severity": "높음",
+                      "extra": ".gitignore 에 .env 가 없습니다." if gitignore_text is not None
+                      else "프로젝트에 .gitignore 파일이 없습니다."}
+    return out
+
+
 # ================= Streamlit 웹 화면 =================
 TEST_FILE_NAME = "test.py"   # 같은 폴더에 올려둘 테스트 파일 이름
 
@@ -960,23 +1242,34 @@ def _render_finding_body(f):
 
 
 def _single_file_tab():
-    uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"], key="single_file")
+    uploaded_file = st.file_uploader(
+        "검사할 파일을 업로드하세요 (.py 는 전체 보안 검사, .env / .json / .js 등은 API 키 유출 검사)",
+        key="single_file")
     if uploaded_file is None:
         st.info("검사할 소스 코드 파일을 업로드해 주세요.")
         return
 
-    code_text = _decode(uploaded_file.read())
+    kind = file_kind(uploaded_file.name)
+    if kind is None:
+        st.warning("지원하지 않는 파일 형식입니다. 파이썬(.py), 설정 파일(.env, .json, .yaml 등), 코드 파일(.js, .ts 등)을 올려 주세요.")
+        return
+    raw = uploaded_file.getvalue()
     with st.expander("업로드한 코드 미리보기"):
-        st.code(code_text, language="python")
+        # 비밀값 파일(.env 등)은 미리보기에서도 키가 그대로 보이지 않도록 표시하지 않음
+        if kind == "python":
+            st.code(_decode(raw), language="python")
+        else:
+            st.caption("API 키가 화면에 노출되지 않도록 설정·코드 파일은 미리보기를 표시하지 않습니다.")
 
     if st.button("보안 취약점 스캔 시작", key="scan_single"):
         st.write("---")
         st.subheader("스캔 결과 리포트")
 
-        findings, error = scan_source(code_text)
+        findings, error = scan_file(uploaded_file.name, raw)
         if error:
             st.warning(error)
-            return
+            if not findings:
+                return
 
         for f in findings:
             _render_finding(f)
@@ -1004,12 +1297,23 @@ def _scan_folder(files):
     results = []
     for i, uf in enumerate(files, 1):
         progress.progress(i / len(files), text=f"{i} / {len(files)} 파일 검사 중: {uf.name}")
+        if file_kind(uf.name) is None:   # .gitignore 등 참고용 파일은 결과에 넣지 않음
+            continue
         try:
-            findings, error = scan_source(_decode(uf.getvalue()))
+            findings, error = scan_file(uf.name, uf.getvalue())
         except Exception as e:   # 스캐너 내부 오류가 나도 다른 파일 검사는 계속
             findings, error = [], f"스캐너 내부 오류: {type(e).__name__}: {e}"
         results.append({"path": uf.name, "findings": findings, "error": error})
     progress.empty()
+
+    # .env 파일이 .gitignore 로 제외되어 있는지 (폴더 맨 위의 .gitignore 기준)
+    root_ignore = next((uf for uf in files if uf.name.replace("\\", "/").count("/") == 1
+                        and _base_name(uf.name) == ".gitignore"), None)
+    gitignore_text = _decode(root_ignore.getvalue()) if root_ignore else None
+    env_findings = check_env_files([uf.name for uf in files], gitignore_text)
+    for r in results:
+        if r["path"] in env_findings:
+            r["findings"] = [env_findings[r["path"]]] + r["findings"]
     return results
 
 
@@ -1025,22 +1329,33 @@ def _results_to_csv(results):
 
 def _folder_tab():
     uploaded = st.file_uploader(
-        "검사할 폴더를 선택하세요 (하위 폴더의 .py 파일까지 모두 검사)",
-        type=["py"], accept_multiple_files="directory", key="folder_files",
+        "검사할 폴더를 선택하세요 (.py 는 전체 보안 검사, .env / .json / .js 등은 API 키 유출 검사)",
+        accept_multiple_files="directory", key="folder_files",
     )
     if not uploaded:
         st.info("검사할 프로젝트 폴더를 업로드해 주세요.")
         return
 
-    targets = sorted((f for f in uploaded if not _is_skipped(f.name)), key=lambda f: f.name)
-    skipped = len(uploaded) - len(targets)
-    msg = f"검사 대상 파이썬 파일 {len(targets)}개"
-    if skipped:
-        msg += f" (가상환경·캐시 등 {skipped}개 제외)"
+    in_scope = [f for f in uploaded if not _is_skipped(f.name)]
+    targets = sorted((f for f in in_scope if file_kind(f.name)), key=lambda f: f.name)
+    # .gitignore 는 검사 대상은 아니지만 .env 점검에 필요하므로 함께 넘김
+    gitignores = [f for f in in_scope if _base_name(f.name) == ".gitignore"]
+    n_py = sum(1 for f in targets if file_kind(f.name) == "python")
+    skipped_dirs = len(uploaded) - len(in_scope)
+    other = len(in_scope) - len(targets) - len(gitignores)
+    msg = f"검사 대상 파일 {len(targets)}개 (파이썬 {n_py}개, 설정·코드 파일 {len(targets) - n_py}개)"
+    notes = []
+    if skipped_dirs:
+        notes.append(f"가상환경·캐시 등 {skipped_dirs}개 제외")
+    if other > 0:
+        notes.append(f"이미지 등 검사하지 않는 형식 {other}개 제외")
+    if notes:
+        msg += " / " + ", ".join(notes)
     st.write(msg)
     if not targets:
-        st.warning("검사할 .py 파일이 없습니다.")
+        st.warning("검사할 파일이 없습니다.")
         return
+    targets = targets + gitignores
 
     signature = tuple((f.name, f.size) for f in targets)
     if st.button("폴더 전체 스캔 시작", key="scan_folder"):
