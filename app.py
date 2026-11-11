@@ -1,31 +1,93 @@
 import ast
+import io
 import re
+import textwrap
+import tokenize
 import streamlit as st
 
+# ================= 탐지 패턴 / 상수 =================
 SQL_KW = re.compile(r'\b(?:SELECT\b.*\bFROM|INSERT\b.*\bINTO|UPDATE\b.*\bSET|DELETE\b.*\bFROM)\b', re.IGNORECASE | re.DOTALL)
-SECRET_NAME = re.compile(r'(password|passwd|pwd|secret|api_key|token)', re.IGNORECASE)
+# 이름 '끝'이 비밀값 단어여야 함 (password_label, token_url 같은 이름은 제외)
+SECRET_NAME = re.compile(
+    r'(?:^|_)(?:password|passwd|pwd|passphrase|secret|secret_key|api_key|apikey|access_key|'
+    r'private_key|auth_key|authenticate_key|token|access_token|auth_token|refresh_token)$',
+    re.IGNORECASE)
+LDAP_FILTER = re.compile(r'\(\s*[&|!]?\s*\(?\s*[A-Za-z][\w.-]*\s*[~<>]?=')
+WEAK_CIPHER = re.compile(r'(?:^|\.)(?:DES|ARC2|ARC4|Blowfish|CAST|XOR)\.new$|(?:^|\.)algorithms\.(?:ARC4|Blowfish|CAST5|IDEA|TripleDES)$')
+WEAK_CRYPTO_HASH = re.compile(r'(?:^|\.)(?:MD2|MD4|MD5|SHA1|SHA)\.new$')
 
 GUIDES = {
-    "SQL 인젝션": "[KISA 보안 가이드] SQL 쿼리를 문자열 결합/f-string/포맷팅으로 만들고 있습니다. execute(sql, (값,)) 형태의 파라미터 바인딩을 사용하세요.",
-    "코드 삽입 (eval/exec)": "[KISA 보안 가이드] eval()/exec()에 변수가 전달됩니다. 사용을 금지하거나 ast.literal_eval 등 안전한 대안을 사용하세요.",
-    "경로 조작": "[KISA 보안 가이드] open()에 검증되지 않은 경로가 전달됩니다. os.path.basename()이나 허용 디렉터리 검증을 적용하세요.",
-    "OS 명령어 삽입": "[KISA 보안 가이드] 셸을 통해 명령을 실행합니다. shell=False와 인자 리스트 방식을 사용하세요.",
-    "안전하지 않은 역직렬화": "[KISA 보안 가이드] 신뢰할 수 없는 데이터를 pickle/yaml.load로 역직렬화하면 코드가 실행될 수 있습니다. json 또는 yaml.safe_load를 사용하세요.",
-    "하드코딩된 중요정보": "[KISA 보안 가이드] 비밀번호/키가 소스에 하드코딩되어 있습니다. 환경변수나 비밀 관리 도구를 사용하세요.",
-    "취약한 해시 알고리즘": "[KISA 보안 가이드] md5/sha1은 취약합니다. sha256 이상 또는 bcrypt 등을 사용하세요.",
-    "SSL 검증 비활성화": "[KISA 보안 가이드] verify=False로 인증서 검증을 끄면 중간자 공격에 노출됩니다.",
-    "디버그 모드 활성화": "[KISA 보안 가이드] debug=True 상태로 배포하면 내부 정보가 노출됩니다.",
+    # ---- 입력데이터 검증 및 표현 ----
+    "SQL 인젝션": "[KISA 보안 가이드 1-1] SQL 쿼리를 문자열 결합/f-string/포맷팅으로 만들고 있습니다. execute(sql, (값,)) 형태의 파라미터 바인딩을 사용하세요.",
+    "코드 삽입 (eval/exec)": "[KISA 보안 가이드 1-2] 검증되지 않은 값이 eval()/exec()에 전달됩니다. 사용을 금지하거나 화이트리스트/isalnum() 등으로 사전 검증하세요.",
+    "경로 조작": "[KISA 보안 가이드 1-3] 외부 입력값이 파일 경로로 사용됩니다. 경로 조작 문자(/, \\, ..)를 제거하거나 os.path.basename(), 허용 목록 검증을 적용하세요.",
+    "자원 삽입": "[KISA 보안 가이드 1-3] 외부 입력값이 소켓 포트 등 자원 식별자로 사용됩니다. 허용 목록(화이트리스트)에 포함된 값만 사용하세요.",
+    "크로스사이트 스크립트(XSS)": "[KISA 보안 가이드 1-4] mark_safe/Markup 등으로 이스케이프를 해제했습니다. 신뢰할 수 없는 데이터는 html.escape()로 치환하고 이스케이프 해제를 사용하지 마세요.",
+    "OS 명령어 삽입": "[KISA 보안 가이드 1-5] 검증되지 않은 값으로 셸 명령을 실행합니다. shell=False와 인자 리스트 방식을 사용하고 실행 가능한 명령은 화이트리스트로 제한하세요.",
+    "신뢰되지 않은 URL 자동접속": "[KISA 보안 가이드 1-7] 외부 입력 URL로 리다이렉트합니다. 허용 URL 목록으로 검증한 뒤 이동하세요.",
+    "부적절한 XML 외부 개체 참조": "[KISA 보안 가이드 1-8] XML 외부 엔티티 처리가 활성화되어 있습니다. feature_external_ges=False, resolve_entities=False로 설정하세요.",
+    "XML 삽입(XPath)": "[KISA 보안 가이드 1-9] XPath 질의를 문자열 결합으로 생성합니다. xpath(query, 변수명=값) 형태로 인자화하세요.",
+    "LDAP 삽입": "[KISA 보안 가이드 1-10] LDAP 필터에 외부 입력값이 그대로 결합됩니다. escape_filter_chars()로 이스케이프한 뒤 사용하세요.",
+    "크로스사이트 요청 위조(CSRF)": "[KISA 보안 가이드 1-11] CSRF 보호가 해제되어 있습니다. csrf_exempt 사용을 피하고 CsrfViewMiddleware/CSRFProtect를 활성화하세요.",
+    "서버사이드 요청 위조(SSRF)": "[KISA 보안 가이드 1-12] 외부 입력 주소로 서버가 직접 요청을 보냅니다. 허용 서버 목록(화이트리스트)으로 검증하세요.",
+    "HTTP 응답분할": "[KISA 보안 가이드 1-13] 외부 입력값이 응답 헤더에 그대로 들어갑니다. \\r, \\n 개행문자를 제거한 뒤 사용하세요.",
+    "포맷 스트링 삽입": "[KISA 보안 가이드 1-16] 외부 입력 문자열을 포맷 문자열로 사용합니다. 고정된 포맷 문자열에 값을 바인딩하세요.",
+    # ---- 보안기능 ----
+    "중요 자원 권한 설정": "[KISA 보안 가이드 2-3] 중요 파일에 그룹/기타 사용자 쓰기 권한을 부여합니다. 0o600/0o700 등 최소 권한만 부여하세요.",
+    "취약한 해시 알고리즘": "[KISA 보안 가이드 2-4] md5/sha1은 취약합니다. sha256 이상을 사용하세요.",
+    "취약한 암호화 알고리즘": "[KISA 보안 가이드 2-4] DES/RC2/RC4/Blowfish 등은 취약합니다. AES, ARIA, SEED 등 검증된 알고리즘을 사용하세요.",
+    "하드코딩된 중요정보": "[KISA 보안 가이드 2-6] 비밀번호/키가 소스에 하드코딩되어 있습니다. 환경변수나 암호화된 별도 설정 파일을 사용하세요.",
+    "충분하지 않은 키 길이": "[KISA 보안 가이드 2-7] 키 길이가 짧습니다. RSA/DSA는 2048비트 이상, ECC는 224비트 이상을 사용하세요.",
+    "적절하지 않은 난수 값": "[KISA 보안 가이드 2-8] 보안 용도(OTP, 토큰, 세션키 등)에 random 모듈을 사용합니다. secrets 모듈을 사용하세요.",
+    "SSL 검증 비활성화": "[KISA 보안 가이드 2-11] 인증서 검증을 끄면 중간자 공격에 노출됩니다. PROTOCOL_TLS_CLIENT / verify=True로 인증서를 검증하세요.",
+    "영속 쿠키 정보 노출": "[KISA 보안 가이드 2-12] 쿠키 만료시간이 과도하게 깁니다. 만료시간을 최소화하고 secure/httponly 옵션을 설정하세요.",
+    # ---- 시간 및 상태 ----
+    "종료되지 않는 재귀": "[KISA 보안 가이드 3-2] 재귀 제한을 과도하게 늘리면 스택 오버플로우/자원 고갈이 발생할 수 있습니다. 기본값(1000) 수준을 유지하세요.",
+    # ---- 에러처리 ----
+    "오류 메시지 정보노출": "[KISA 보안 가이드 4-1] 스택 트레이스를 출력하면 내부 구조가 노출됩니다. 최소 정보만 로깅(logger.error)하세요.",
+    "오류상황 대응 부재": "[KISA 보안 가이드 4-2] 예외를 잡고 아무 조치도 하지 않습니다(pass). 적절한 예외 처리를 추가하세요.",
+    "부적절한 예외 처리": "[KISA 보안 가이드 4-3] except: 로 모든 예외를 광범위하게 잡고 있습니다. 발생 가능한 예외를 구체적으로 나눠 처리하세요.",
+    # ---- 코드오류 / 캡슐화 ----
+    "안전하지 않은 역직렬화": "[KISA 보안 가이드 5-3] 신뢰할 수 없는 데이터를 pickle/yaml.load로 역직렬화하면 코드가 실행될 수 있습니다. 서명(HMAC) 검증 후 사용하거나 json / yaml.safe_load를 사용하세요.",
+    "디버그 모드 활성화": "[KISA 보안 가이드 6-2] DEBUG 모드로 배포하면 내부 정보가 노출됩니다. 운영 환경에서는 DEBUG=False로 설정하세요.",
 }
 
 SQL_EXEC_FUNCS = {"execute", "executemany", "executescript", "raw"}
+# 외부 입력으로 간주하는 request 속성 (request.method 등은 제외)
+REQUEST_ATTRS = {"GET", "POST", "FILES", "COOKIES", "META", "body", "data", "form", "args", "values",
+                 "json", "get_json", "files", "cookies", "headers", "query_params"}
+# 반환값을 '검증/치환된 값'으로 보는 함수
+SANITIZERS = {"escape", "escape_filter_chars", "escape_dn_chars", "basename", "secure_filename", "quote", "clean"}
+GUARD_METHODS = {"isalnum", "isalpha", "isdigit", "isdecimal", "isnumeric", "isidentifier"}
+VERIFY_NAME = re.compile(r'verif|valid', re.IGNORECASE)
+RESPONSE_FACTORIES = {"HttpResponse", "JsonResponse", "StreamingHttpResponse", "FileResponse",
+                      "HttpResponseRedirect", "Response", "make_response"}
+PATH_FUNCS = {"io.open", "codecs.open", "os.open", "os.remove", "os.unlink", "os.rmdir",
+              "shutil.rmtree", "shutil.copy", "shutil.copyfile", "shutil.move", "flask.send_file"}
+SSRF_FUNCS = {"requests.get", "requests.post", "requests.put", "requests.delete", "requests.head",
+              "requests.patch", "requests.options", "urllib.request.urlopen", "httpx.get", "httpx.post"}
+REDIRECT_FUNCS = {"redirect", "HttpResponseRedirect", "HttpResponsePermanentRedirect"}
+DESER_FUNCS = {"pickle.load", "pickle.loads", "pickle.Unpickler", "cPickle.load", "cPickle.loads",
+               "dill.load", "dill.loads", "marshal.load", "marshal.loads", "jsonpickle.decode"}
+SAFE_YAML_LOADERS = {"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"}
+RANDOM_FUNCS = {"random", "randint", "randrange", "choice", "choices", "sample", "getrandbits",
+                "uniform", "shuffle", "randbytes"}
+SECURITY_WORDS = {"otp", "token", "session", "password", "passwd", "pwd", "pw", "secret", "salt",
+                  "nonce", "csrf", "key", "apikey", "auth", "crypto", "cipher", "iv", "sign",
+                  "signature", "verification", "verify"}
+EXIT_STMTS = (ast.Return, ast.Raise, ast.Continue, ast.Break)
+IGNORED_PASS_EXC = {"ImportError", "ModuleNotFoundError"}
+COOKIE_MAX_AGE_LIMIT = 60 * 60 * 24 * 30   # 30일 초과 시 영속 쿠키로 판단
+RECURSION_LIMIT_MAX = 10000                 # 이 값을 넘게 설정하면 과도한 재귀 제한으로 판단
 
 
-def _call_name(func):
+# ================= 공통 헬퍼 =================
+def _raw_name(func):
     """os.system -> 'os.system', eval -> 'eval', cur.execute -> 'cur.execute'"""
     if isinstance(func, ast.Name):
         return func.id
     if isinstance(func, ast.Attribute):
-        base = _call_name(func.value)
+        base = _raw_name(func.value)
         return f"{base}.{func.attr}" if base else func.attr
     return ""
 
@@ -34,10 +96,13 @@ def _is_str_const(node):
     return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
-def _has_sql_text(node):
-    """노드 안의 문자열 상수들에 SQL 키워드가 있는가"""
-    text = " ".join(n.value for n in ast.walk(node) if _is_str_const(n))
-    return bool(SQL_KW.search(text))
+def _all_const_str(node):
+    """'a' + 'b' + 'c' 처럼 상수끼리만 결합된 문자열인가"""
+    if _is_str_const(node):
+        return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _all_const_str(node.left) and _all_const_str(node.right)
+    return False
 
 
 def _is_dynamic_str(node):
@@ -45,103 +110,632 @@ def _is_dynamic_str(node):
     if isinstance(node, ast.JoinedStr):
         return any(isinstance(v, ast.FormattedValue) for v in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
-        return not (_is_str_const(node.left) and _is_str_const(node.right))
+        return not _all_const_str(node)
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr == "format"):
         return True
     return False
 
 
+def _const_text(node):
+    return " ".join(n.value for n in ast.walk(node) if _is_str_const(n))
+
+
+def _const_int(node):
+    """60*60*24 같은 정수 상수식을 계산 (계산 불가 시 None)"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        v = _const_int(node.operand)
+        return -v if v is not None else None
+    if isinstance(node, ast.BinOp):
+        a, b = _const_int(node.left), _const_int(node.right)
+        if a is None or b is None:
+            return None
+        ops = {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b,
+               ast.Pow: lambda: a ** b if b < 64 else None, ast.BitOr: lambda: a | b}
+        fn = ops.get(type(node.op))
+        return fn() if fn else None
+    return None
+
+
+def _value_names(node):
+    """식 안에서 '값'으로 쓰인 변수 이름들 (호출되는 함수 이름은 제외)"""
+    if node is None:
+        return set()
+    skip = {id(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)}
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and id(n) not in skip}
+
+
+def _target_names(target):
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out = []
+        for e in target.elts:
+            out.extend(_target_names(e))
+        return out
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return []
+
+
+def _target_key(target):
+    """대입 대상의 '이름' (password / self.password / config['SECRET_KEY'])"""
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    if isinstance(target, ast.Subscript) and _is_str_const(target.slice):
+        return target.slice.value
+    return None
+
+
+def _secret_literal(node):
+    """하드코딩된 비밀값으로 볼 만한 문자열 상수인가"""
+    if not _is_str_const(node):
+        return False
+    v = node.value
+    if len(v) < 4 or not v.isascii() or any(c.isspace() for c in v):
+        return False
+    if v.startswith(("http://", "https://", "<", "${", "{{", "%(")):
+        return False
+    if re.fullmatch(r'[A-Z][A-Z0-9_]*', v):   # 'DB_PASSWORD' 같은 환경변수 이름
+        return False
+    return True
+
+
+def _name_tokens(name):
+    return {t.lower() for t in re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+', name or "")}
+
+
+def _comment_columns(source):
+    """줄 번호 -> 주석 시작 컬럼 (리포트 코드에서 주석을 잘라내기 위함)"""
+    cols = {}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                cols[tok.start[0]] = tok.start[1]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return cols   # 토큰화 실패 시 그때까지 찾은 주석 위치만 사용
+    return cols
+
+
 class SecurityVisitor(ast.NodeVisitor):
     def __init__(self, source):
         self.lines = source.splitlines()
+        self.comment_col = _comment_columns(source)
         self.findings = []
-        self.tainted_sql = {}   # 위험하게 만든 SQL을 담은 변수명 -> 줄 번호
-        self.sql_vars = set()   # SQL 상수 문자열을 담은 변수명 (+= 누적 감시용)
+        self._seen = set()
+        self.aliases = {}        # import 별칭: Popen -> subprocess.Popen, np -> numpy
+        self.func_stack = []     # 현재 함수 이름 (난수 사용 문맥 판단용)
+        self.assign_names = set()
+        self._reset_scope()
 
-    def report(self, rule, node, extra=""):
-        line = self.lines[node.lineno - 1].strip() if node.lineno <= len(self.lines) else ""
-        self.findings.append({"rule": rule, "line": node.lineno, "code": line,
+    # ---------- 스코프 (함수 단위로 변수 상태를 분리) ----------
+    def _reset_scope(self):
+        self.tainted_sql = {}    # 위험하게 만든 SQL을 담은 변수명 -> 줄 번호
+        self.sql_vars = set()    # SQL 상수 문자열을 담은 변수명 (+= 누적, % 포맷 감시용)
+        self.tainted = set()     # 외부 입력(request.*, input(), sys.argv)에서 온 변수
+        self.safe = set()        # 상수/검증/치환을 거친 변수
+        self.dyn_vars = {}       # 검증 안 된 값으로 동적 생성된 문자열 변수 -> 값 노드
+        self.response_vars = set()
+        self.verified = 0        # hmac.compare_digest / 서명 검증 if 블록 깊이
+
+    def _save_scope(self):
+        return (self.tainted_sql, self.sql_vars, self.tainted, self.safe,
+                self.dyn_vars, self.response_vars, self.verified)
+
+    def _restore_scope(self, saved):
+        (self.tainted_sql, self.sql_vars, self.tainted, self.safe,
+         self.dyn_vars, self.response_vars, self.verified) = saved
+
+    # ---------- 리포트 ----------
+    def _snippet(self, node, single_line):
+        start = node.lineno
+        end = start if single_line else min(getattr(node, "end_lineno", None) or start, start + 4)
+        out = []
+        for ln in range(start, end + 1):
+            if ln > len(self.lines):
+                break
+            text = self.lines[ln - 1]
+            col = self.comment_col.get(ln)
+            if col is not None:
+                text = text[:col]          # 주석은 제외하고 코드만 표시
+            if text.strip():
+                out.append(text.rstrip())
+        return textwrap.dedent("\n".join(out)).strip()
+
+    def report(self, rule, node, extra="", single_line=False):
+        key = (rule, node.lineno)
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.findings.append({"rule": rule, "line": node.lineno,
+                              "code": self._snippet(node, single_line),
                               "guide": GUIDES[rule], "extra": extra})
 
-    # ---- 대입문: SQL 변수 추적 + 하드코딩 비밀값 ----
-    def visit_Assign(self, node):
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                if _is_dynamic_str(node.value) and _has_sql_text(node.value):
-                    self.tainted_sql[target.id] = node.lineno
-                else:
-                    self.tainted_sql.pop(target.id, None)   # 안전한 값으로 덮어쓰면 해제
-                if _is_str_const(node.value) and _has_sql_text(node.value):
-                    self.sql_vars.add(target.id)
-                else:
-                    self.sql_vars.discard(target.id)
-                if (SECRET_NAME.search(target.id) and _is_str_const(node.value)
-                        and len(node.value.value) >= 4):
-                    self.report("하드코딩된 중요정보", node)
+    # ---------- 이름 / 오염(taint) 판단 ----------
+    def _call_name(self, func):
+        raw = _raw_name(func)
+        if not raw:
+            return ""
+        head, _, rest = raw.partition(".")
+        full = self.aliases.get(head, head)
+        return f"{full}.{rest}" if rest else full
+
+    def _is_request(self, node):
+        parts = _raw_name(node).split(".")
+        for i, p in enumerate(parts[:-1]):
+            if p == "request" and parts[i + 1] in REQUEST_ATTRS:
+                return True
+        return False
+
+    def _is_sanitizer_call(self, node):
+        if not isinstance(node, ast.Call):
+            return False
+        name = self._call_name(node.func)
+        short = name.split(".")[-1]
+        if short in SANITIZERS:
+            return True
+        # x.replace('..', '') / re.sub(패턴, '', x): 위험 문자 제거
+        if short == "replace" and len(node.args) >= 2 and _is_str_const(node.args[1]) \
+                and node.args[1].value == "":
+            return True
+        if name == "re.sub" and len(node.args) >= 2 and _is_str_const(node.args[1]) \
+                and node.args[1].value == "":
+            return True
+        return False
+
+    def _tainted(self, node):
+        """외부 입력에서 온 (검증되지 않은) 값인가"""
+        if node is None:
+            return False
+        if isinstance(node, ast.Name):
+            return node.id in self.tainted and node.id not in self.safe
+        if isinstance(node, ast.Call):
+            if self._is_sanitizer_call(node):
+                return False
+            if isinstance(node.func, ast.Name) and node.func.id == "input":
+                return True
+            return any(self._tainted(c) for c in ast.iter_child_nodes(node))
+        if isinstance(node, ast.Attribute):
+            if self._is_request(node) or self._call_name(node) == "sys.argv":
+                return True
+            return self._tainted(node.value)
+        return any(self._tainted(c) for c in ast.iter_child_nodes(node))
+
+    def _is_clean(self, node):
+        """상수이거나, 검증/치환을 거친 변수만으로 이뤄진 값인가"""
+        if node is None:
+            return False
+        if self._is_sanitizer_call(node):
+            return True
+        if self._tainted(node):
+            return False
+        for n in _value_names(node):
+            if not (n in self.safe or n.isupper() or n in self.aliases):
+                return False
+        return True
+
+    def _is_dyn_unclean(self, node):
+        if isinstance(node, ast.Name):
+            return node.id in self.dyn_vars
+        return _is_dynamic_str(node) and not self._is_clean(node)
+
+    def _has_sql_text(self, node):
+        """SQL 키워드가 들어있는 문자열이 쓰였는가 (SQL 상수를 담은 변수 포함)"""
+        if SQL_KW.search(_const_text(node)):
+            return True
+        return any(isinstance(n, ast.Name) and n.id in self.sql_vars for n in ast.walk(node))
+
+    def _security_context(self):
+        words = set()
+        if self.func_stack:
+            words |= _name_tokens(self.func_stack[-1])
+        for n in self.assign_names:
+            words |= _name_tokens(n)
+        return bool(words & SECURITY_WORDS)
+
+    # ---------- import (별칭 추적) ----------
+    def visit_Import(self, node):
+        for a in node.names:
+            if a.asname:
+                self.aliases[a.asname] = a.name
+            else:
+                head = a.name.split(".")[0]
+                self.aliases[head] = head
+
+    def visit_ImportFrom(self, node):
+        mod = node.module or ""
+        for a in node.names:
+            self.aliases[a.asname or a.name] = f"{mod}.{a.name}" if mod else a.name
+
+    # ---------- 함수 정의 ----------
+    def visit_FunctionDef(self, node):
+        for d in node.decorator_list:
+            target = d.func if isinstance(d, ast.Call) else d
+            if self._call_name(target).split(".")[-1] == "csrf_exempt":
+                self.report("크로스사이트 요청 위조(CSRF)", d, single_line=True)
+        saved = self._save_scope()
+        self._reset_scope()
+        self.func_stack.append(node.name)
         self.generic_visit(node)
+        self.func_stack.pop()
+        self._restore_scope(saved)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    # ---------- if 문: 화이트리스트/isalnum/서명 검증 가드 ----------
+    def _guard(self, test):
+        """반환: (검증되는 변수 집합, '+'(참일 때 안전) / '-'(거짓일 때 안전) / None, 서명검증 여부)"""
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            names, pol, _ = self._guard(test.operand)
+            return names, {"+": "-", "-": "+"}.get(pol), False
+        if isinstance(test, ast.BoolOp):
+            parts = [self._guard(v) for v in test.values]
+            want = "+" if isinstance(test.op, ast.And) else "-"
+            hits = [p for p in parts if p[1] == want]
+            if not hits:
+                return set(), None, False
+            names = set().union(*(p[0] for p in hits))
+            return names, want, any(p[2] for p in hits)
+        if isinstance(test, ast.Compare) and len(test.ops) == 1:
+            op, right = test.ops[0], test.comparators[0]
+            left = _value_names(test.left)
+            if isinstance(op, ast.In):
+                return left, "+", False
+            if isinstance(op, ast.NotIn):
+                return left, "-", False
+            if isinstance(op, ast.Eq) and isinstance(right, ast.Constant):
+                return left, "+", False
+            if isinstance(op, ast.NotEq) and isinstance(right, ast.Constant):
+                return left, "-", False
+            return set(), None, False
+        if isinstance(test, ast.Call):
+            name = self._call_name(test.func)
+            short = name.split(".")[-1]
+            if isinstance(test.func, ast.Attribute) and short in GUARD_METHODS:
+                return _value_names(test.func.value), "+", False
+            if short == "compare_digest":
+                return set(), "+", True
+            if short in ("match", "fullmatch"):
+                args = test.args[1:] if name.startswith("re.") else test.args
+                return set().union(*(_value_names(a) for a in args)) if args else set(), "+", False
+            if VERIFY_NAME.search(short):
+                return set().union(*(_value_names(a) for a in test.args)) if test.args else set(), "+", True
+            return set(), None, False
+        if isinstance(test, ast.Name) and VERIFY_NAME.search(test.id):
+            return set(), "+", True
+        return set(), None, False
+
+    def _visit_block(self, stmts, names, verified):
+        added = names - self.safe
+        self.safe |= added
+        self.verified += 1 if verified else 0
+        for s in stmts:
+            self.visit(s)
+        self.verified -= 1 if verified else 0
+        self.safe -= added
+
+    def visit_If(self, node):
+        names, pol, verified = self._guard(node.test)
+        self.visit(node.test)
+        self._visit_block(node.body, names if pol == "+" else set(), verified and pol == "+")
+        self._visit_block(node.orelse, names if pol == "-" else set(), False)
+        # if x not in ALLOW: return  -> 이후 코드에서 x는 검증된 값
+        if pol == "-" and node.body and isinstance(node.body[-1], EXIT_STMTS):
+            self.safe |= names
+        if pol == "+" and node.orelse and isinstance(node.orelse[-1], EXIT_STMTS):
+            self.safe |= names
+
+    # ---------- 반복문 ----------
+    def visit_For(self, node):
+        if self._tainted(node.iter):
+            for n in _target_names(node.target):
+                self.tainted.add(n)
+                self.safe.discard(n)
+        self.generic_visit(node)
+
+    # ---------- 예외 처리 ----------
+    def visit_ExceptHandler(self, node):
+        only_pass = all(isinstance(s, ast.Pass) or
+                        (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                         and s.value.value is Ellipsis) for s in node.body)
+        exc_name = _raw_name(node.type).split(".")[-1] if node.type is not None else ""
+        if only_pass and exc_name not in IGNORED_PASS_EXC:
+            self.report("오류상황 대응 부재", node, single_line=True)
+        elif node.type is None:
+            self.report("부적절한 예외 처리", node, single_line=True)
+        self.generic_visit(node)
+
+    # ---------- 대입문 ----------
+    def visit_Assign(self, node):
+        self._assign(node.targets, node.value, node)
+
+    def visit_AnnAssign(self, node):
+        if node.value is not None:
+            self._assign([node.target], node.value, node)
+
+    def _assign(self, targets, value, node):
+        self.assign_names = {n for t in targets for n in ([_target_key(t)] + _target_names(t)) if n}
+        self.visit(value)
+        self.assign_names = set()
+        tainted = self._tainted(value)
+        clean = self._is_clean(value)
+        is_dyn = _is_dynamic_str(value) and not clean
+        is_resp = (isinstance(value, ast.Call)
+                   and self._call_name(value.func).split(".")[-1] in RESPONSE_FACTORIES)
+        for target in targets:
+            for n in _target_names(target):
+                if tainted:
+                    self.tainted.add(n)
+                    self.safe.discard(n)
+                else:
+                    self.tainted.discard(n)
+                    (self.safe.add if clean else self.safe.discard)(n)
+                if is_dyn:
+                    self.dyn_vars[n] = value
+                else:
+                    self.dyn_vars.pop(n, None)
+                (self.response_vars.add if is_resp else self.response_vars.discard)(n)
+            if isinstance(target, ast.Name):
+                self._track_sql(target.id, value, node)
+            self._check_assign(target, value, node)
+            self.visit(target)
+
+    def _track_sql(self, name, value, node):
+        if _is_dynamic_str(value) and self._has_sql_text(value):
+            self.tainted_sql[name] = node.lineno
+        else:
+            self.tainted_sql.pop(name, None)   # 안전한 값으로 덮어쓰면 해제
+        if _all_const_str(value) and SQL_KW.search(_const_text(value)):
+            self.sql_vars.add(name)
+        else:
+            self.sql_vars.discard(name)
+
+    def _check_assign(self, target, value, node):
+        key = _target_key(target)
+        is_true = isinstance(value, ast.Constant) and value.value is True
+        is_false = isinstance(value, ast.Constant) and value.value is False
+
+        # 하드코딩된 중요정보: password = "...", self.secret = "...", config['SECRET_KEY'] = "..."
+        if key and SECRET_NAME.search(key) and _secret_literal(value):
+            self.report("하드코딩된 중요정보", node)
+
+        # 디버그 모드: DEBUG = True / app.debug = True / app.config['DEBUG'] = True
+        if is_true and (key == "DEBUG" or (isinstance(target, ast.Attribute) and target.attr == "debug")):
+            self.report("디버그 모드 활성화", node)
+
+        # SSL: ctx.verify_mode = ssl.CERT_NONE / ctx.check_hostname = False
+        if isinstance(target, ast.Attribute):
+            if target.attr == "verify_mode" and self._call_name(value).endswith("CERT_NONE"):
+                self.report("SSL 검증 비활성화", node)
+            if target.attr == "check_hostname" and is_false:
+                self.report("SSL 검증 비활성화", node)
+
+        # CSRF: Flask-WTF 해제 / Django 미들웨어에서 CsrfViewMiddleware 누락
+        if key == "WTF_CSRF_ENABLED" and is_false:
+            self.report("크로스사이트 요청 위조(CSRF)", node)
+        if key == "MIDDLEWARE" and isinstance(value, (ast.List, ast.Tuple)):
+            items = [e.value for e in value.elts if _is_str_const(e)]
+            if any(i.startswith("django.") for i in items) and \
+                    not any(i.endswith("CsrfViewMiddleware") for i in items):
+                self.report("크로스사이트 요청 위조(CSRF)", node, single_line=True,
+                            extra="MIDDLEWARE 목록에 'django.middleware.csrf.CsrfViewMiddleware'가 없습니다.")
+
+        # 영속 쿠키: SESSION_COOKIE_AGE 과다
+        if key == "SESSION_COOKIE_AGE":
+            age = _const_int(value)
+            if age is not None and age > COOKIE_MAX_AGE_LIMIT:
+                self.report("영속 쿠키 정보 노출", node)
+
+        # HTTP 응답분할: res['Header'] = 외부입력 / response.headers['X'] = 외부입력
+        if isinstance(target, ast.Subscript):
+            obj = target.value
+            is_header = ((isinstance(obj, ast.Name) and obj.id in self.response_vars)
+                         or (isinstance(obj, ast.Attribute) and obj.attr == "headers"))
+            if is_header and self._tainted(value):
+                self.report("HTTP 응답분할", node)
 
     def visit_AugAssign(self, node):   # query += user_id
-        if isinstance(node.target, ast.Name) and isinstance(node.op, ast.Add):
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
             name = node.target.id
-            is_sql_var = name in self.sql_vars or name in self.tainted_sql
-            if is_sql_var and not _is_str_const(node.value):
-                self.tainted_sql[name] = node.lineno
+            if isinstance(node.op, ast.Add):
+                is_sql_var = name in self.sql_vars or name in self.tainted_sql
+                if is_sql_var and not _is_str_const(node.value):
+                    self.tainted_sql[name] = node.lineno
+            if self._tainted(node.value):
+                self.tainted.add(name)
+                self.safe.discard(name)
+
+    # ---------- 딕셔너리: {"password": "1234"} ----------
+    def visit_Dict(self, node):
+        for k, v in zip(node.keys, node.values):
+            if k is not None and _is_str_const(k) and SECRET_NAME.search(k.value) and _secret_literal(v):
+                self.report("하드코딩된 중요정보", v, single_line=True)
         self.generic_visit(node)
 
-    # ---- 함수 호출 ----
+    # ---------- 함수 호출 ----------
     def visit_Call(self, node):
-        name = _call_name(node.func)
+        name = self._call_name(node.func)
         short = name.split(".")[-1]
         args = node.args
         kw = {k.arg: k.value for k in node.keywords if k.arg}
+        builtin = isinstance(node.func, ast.Name) and node.func.id not in self.aliases
+        first = args[0] if args else None
 
         # SQL 인젝션: execute(동적 SQL) 또는 execute(위험 변수)
-        if short in SQL_EXEC_FUNCS and args:
-            q = args[0]
-            if _is_dynamic_str(q) and _has_sql_text(q):
+        if short in SQL_EXEC_FUNCS and first is not None:
+            if _is_dynamic_str(first) and self._has_sql_text(first):
                 self.report("SQL 인젝션", node)
-            elif isinstance(q, ast.Name) and q.id in self.tainted_sql:
+            elif isinstance(first, ast.Name) and first.id in self.tainted_sql:
                 self.report("SQL 인젝션", node,
-                            f"변수 '{q.id}'는 {self.tainted_sql[q.id]}번째 줄에서 위험하게 생성됨")
+                            f"변수 '{first.id}'는 {self.tainted_sql[first.id]}번째 줄에서 위험하게 생성됨")
 
-        # eval/exec: 메서드(model.eval)는 제외, 상수 인자도 제외
-        if isinstance(node.func, ast.Name) and name in ("eval", "exec"):
-            if args and not _is_str_const(args[0]):
+        # 코드 삽입: 검증되지 않은 값이 eval/exec로 (메서드 model.eval 제외)
+        if builtin and name in ("eval", "exec") and first is not None:
+            if not self._is_clean(first) and not self.verified:
                 self.report("코드 삽입 (eval/exec)", node)
 
-        # 경로 조작: 내장 open()에 상수가 아닌 경로
-        if isinstance(node.func, ast.Name) and name == "open" and args:
-            p = args[0]
-            if not _is_str_const(p) and not (isinstance(p, ast.Name) and p.id.isupper()):
-                self.report("경로 조작", node)
+        # 경로 조작: 외부 입력값이 파일 경로로
+        if ((builtin and name == "open") or name in PATH_FUNCS) and self._tainted(first):
+            self.report("경로 조작", node)
+
+        # 자원 삽입: 외부 입력값이 포트/주소로
+        if short in ("bind", "connect", "connect_ex", "create_connection") and \
+                isinstance(first, ast.Tuple) and any(self._tainted(e) for e in first.elts):
+            self.report("자원 삽입", node)
 
         # OS 명령어 삽입
-        if name in ("os.system", "os.popen"):
+        if name in ("os.system", "os.popen") and first is not None and not self._is_clean(first):
             self.report("OS 명령어 삽입", node)
         if name.startswith("subprocess.") and isinstance(kw.get("shell"), ast.Constant) \
-                and kw["shell"].value is True:
+                and kw["shell"].value is True and first is not None and not self._is_clean(first):
             self.report("OS 명령어 삽입", node)
 
-        # 역직렬화
-        if name in ("pickle.load", "pickle.loads"):
-            self.report("안전하지 않은 역직렬화", node)
-        if name == "yaml.load":
-            loader = kw.get("Loader")
-            if not (loader is not None and _call_name(loader) in ("yaml.SafeLoader", "SafeLoader")):
+        # 역직렬화 (HMAC/서명 검증 블록 안은 제외)
+        if not self.verified:
+            if name in DESER_FUNCS or name == "yaml.unsafe_load":
                 self.report("안전하지 않은 역직렬화", node)
+            if name in ("yaml.load", "yaml.load_all"):
+                loader = kw.get("Loader") or (args[1] if len(args) > 1 else None)
+                if loader is None or self._call_name(loader).split(".")[-1] not in SAFE_YAML_LOADERS:
+                    self.report("안전하지 않은 역직렬화", node)
 
-        # 취약한 해시
-        if name in ("hashlib.md5", "hashlib.sha1"):
+        # 취약한 해시 (usedforsecurity=False 는 비보안 용도로 제외)
+        non_security = isinstance(kw.get("usedforsecurity"), ast.Constant) and kw["usedforsecurity"].value is False
+        weak_new = (name == "hashlib.new" and _is_str_const(first)
+                    and first.value.lower() in ("md5", "sha1", "md4", "md2"))
+        if not non_security and (name in ("hashlib.md5", "hashlib.sha1") or weak_new
+                                 or WEAK_CRYPTO_HASH.search(name)):
             self.report("취약한 해시 알고리즘", node)
 
-        # verify=False / debug=True
+        # 취약한 암호화 알고리즘
+        if WEAK_CIPHER.search(name):
+            self.report("취약한 암호화 알고리즘", node)
+
+        # 충분하지 않은 키 길이
+        self._check_key_length(node, name, short, first, kw)
+
+        # 적절하지 않은 난수: 보안 문맥(otp/token/session/key...)에서 random 사용
+        if name.startswith("random.") and short in RANDOM_FUNCS and self._security_context():
+            self.report("적절하지 않은 난수 값", node)
+
+        # 중요 자원 권한: 그룹/기타 쓰기 권한
+        mode = None
+        if name in ("os.chmod", "os.lchmod", "os.fchmod") and len(args) > 1:
+            mode = args[1]
+        elif short == "chmod" and not name.startswith("os.") and len(args) == 1:
+            mode = args[0]
+        mode = kw.get("mode", mode)
+        if mode is not None:
+            m = _const_int(mode)
+            stat_bits = {n.attr for n in ast.walk(mode) if isinstance(n, ast.Attribute)}
+            if (m is not None and m & 0o022) or stat_bits & {"S_IWOTH", "S_IRWXO", "S_IWGRP", "S_IRWXG"}:
+                self.report("중요 자원 권한 설정", node)
+
+        # SSL 검증 비활성화
         if isinstance(kw.get("verify"), ast.Constant) and kw["verify"].value is False:
             self.report("SSL 검증 비활성화", node)
+        if name == "ssl._create_unverified_context" or \
+                (kw.get("cert_reqs") is not None and self._call_name(kw["cert_reqs"]).endswith("CERT_NONE")):
+            self.report("SSL 검증 비활성화", node)
+
+        # 디버그 모드
         if isinstance(kw.get("debug"), ast.Constant) and kw["debug"].value is True:
             self.report("디버그 모드 활성화", node)
 
+        # XSS: 이스케이프 해제 함수에 동적 값
+        if short in ("mark_safe", "Markup", "SafeString", "render_template_string") and \
+                first is not None and not self._is_clean(first):
+            self.report("크로스사이트 스크립트(XSS)", node)
+
+        # 신뢰되지 않은 URL 자동접속
+        if short in REDIRECT_FUNCS and self._tainted(first):
+            self.report("신뢰되지 않은 URL 자동접속", node)
+
+        # XXE
+        if short == "setFeature" and len(args) >= 2 and \
+                self._call_name(args[0]).endswith(("feature_external_ges", "feature_external_pes")) and \
+                isinstance(args[1], ast.Constant) and args[1].value is True:
+            self.report("부적절한 XML 외부 개체 참조", node)
+        if short == "XMLParser":
+            re_ent, no_net = kw.get("resolve_entities"), kw.get("no_network")
+            if (isinstance(re_ent, ast.Constant) and re_ent.value is True) or \
+                    (isinstance(no_net, ast.Constant) and no_net.value is False):
+                self.report("부적절한 XML 외부 개체 참조", node)
+
+        # XPath 삽입
+        if short == "xpath" and first is not None and (self._is_dyn_unclean(first) or self._tainted(first)):
+            self.report("XML 삽입(XPath)", node)
+
+        # LDAP 삽입
+        if short in ("search", "search_s", "search_st", "search_ext", "search_ext_s"):
+            flt = kw.get("search_filter") or kw.get("filterstr")
+            if flt is None:
+                idx = 1 if short == "search" else 2
+                flt = args[idx] if len(args) > idx else None
+            if flt is not None and self._is_dyn_unclean(flt):
+                src = self.dyn_vars.get(flt.id) if isinstance(flt, ast.Name) else flt
+                if LDAP_FILTER.search(_const_text(src)):
+                    self.report("LDAP 삽입", node)
+
+        # SSRF
+        url = kw.get("url", args[1] if name == "requests.request" and len(args) > 1 else first)
+        if (name in SSRF_FUNCS or name == "requests.request") and self._tainted(url):
+            self.report("서버사이드 요청 위조(SSRF)", node)
+
+        # 포맷 스트링 삽입: 외부입력.format(...)
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("format", "format_map") \
+                and self._tainted(node.func.value):
+            self.report("포맷 스트링 삽입", node)
+
+        # 영속 쿠키
+        if short == "set_cookie":
+            age = _const_int(kw["max_age"]) if "max_age" in kw else None
+            if age is not None and age > COOKIE_MAX_AGE_LIMIT:
+                self.report("영속 쿠키 정보 노출", node)
+
+        # 오류 메시지 정보노출
+        if name in ("traceback.print_exc", "traceback.print_exception", "traceback.print_tb",
+                    "traceback.print_stack"):
+            self.report("오류 메시지 정보노출", node)
+
+        # 재귀 제한 과다
+        if name == "sys.setrecursionlimit":
+            limit = _const_int(first) if first is not None else None
+            if limit is not None and limit > RECURSION_LIMIT_MAX:
+                self.report("종료되지 않는 재귀", node)
+
+        # 함수 키워드 인자로 하드코딩된 비밀값: connect(passwd='1234')
+        for k in node.keywords:
+            if k.arg and SECRET_NAME.search(k.arg) and _secret_literal(k.value):
+                self.report("하드코딩된 중요정보", k.value, single_line=True)
+
         self.generic_visit(node)
+
+    def _check_key_length(self, node, name, short, first, kw):
+        if name.endswith(("RSA.generate", "DSA.generate")) and first is not None:
+            bits = _const_int(first)
+            if bits is not None and bits < 2048:
+                self.report("충분하지 않은 키 길이", node)
+        if short == "generate_private_key" and "key_size" in kw:
+            bits = _const_int(kw["key_size"])
+            if bits is not None and bits < 2048:
+                self.report("충분하지 않은 키 길이", node)
+        curve = None
+        if short == "get_curve" and _is_str_const(first):
+            curve = first.value
+        elif name.endswith("ECC.generate") and _is_str_const(kw.get("curve")):
+            curve = kw["curve"].value
+        elif re.fullmatch(r'SEC[PT]\d+[RK]\d', short):
+            curve = short
+        if curve:
+            m = re.search(r'(\d{3})', curve)
+            if m and int(m.group(1)) < 224:
+                self.report("충분하지 않은 키 길이", node)
 
 
 def scan_source(source):
