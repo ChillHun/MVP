@@ -14,6 +14,14 @@ SECRET_NAME = re.compile(
     r'(?:^|_)(?:password|passwd|pwd|pw|passphrase|secret|secret_key|api_key|apikey|access_key|'
     r'private_key|auth_key|authenticate_key|token|access_token|auth_token|refresh_token)$',
     re.IGNORECASE)
+CAMEL_BOUNDARY = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
+
+
+def _is_secret_name(name):
+    """비밀값 이름인가. camelCase 도 단어로 나눠 판단 (adminPassword -> admin_Password, apiKey -> api_Key)"""
+    return bool(name) and SECRET_NAME.search(CAMEL_BOUNDARY.sub("_", name)) is not None
+
+
 LDAP_FILTER = re.compile(r'\(\s*[&|!]?\s*\(?\s*[A-Za-z][\w.-]*\s*[~<>]?=')
 WEAK_CIPHER = re.compile(r'(?:^|\.)(?:DES|ARC2|ARC4|Blowfish|CAST|XOR)\.new$|(?:^|\.)algorithms\.(?:ARC4|Blowfish|CAST5|IDEA|TripleDES)$')
 WEAK_CRYPTO_HASH = re.compile(r'(?:^|\.)(?:MD2|MD4|MD5|SHA1|SHA)\.new$')
@@ -200,6 +208,8 @@ def _secret_literal(node):
     if v.startswith(("http://", "https://", "<", "${", "{{", "%(")):
         return False
     if re.fullmatch(r'[A-Z][A-Z0-9_]*', v):   # 'DB_PASSWORD' 같은 환경변수 이름
+        return False
+    if re.fullmatch(r'\d+(?:\.\d+){2,}', v):  # '1.2.840.113549' 같은 OID / 버전 번호
         return False
     return True
 
@@ -605,7 +615,7 @@ class SecurityVisitor(ast.NodeVisitor):
         is_false = isinstance(value, ast.Constant) and value.value is False
 
         # 하드코딩된 중요정보: password = "...", self.secret = "...", config['SECRET_KEY'] = "..."
-        if key and SECRET_NAME.search(key) and _secret_literal(value):
+        if key and _is_secret_name(key) and _secret_literal(value):
             self.report("하드코딩된 중요정보", node)
 
         # 디버그 모드: DEBUG = True / app.debug = True / app.config['DEBUG'] = True
@@ -658,7 +668,7 @@ class SecurityVisitor(ast.NodeVisitor):
     # ---------- 딕셔너리: {"password": "1234"} ----------
     def visit_Dict(self, node):
         for k, v in zip(node.keys, node.values):
-            if k is not None and _is_str_const(k) and SECRET_NAME.search(k.value) and _secret_literal(v):
+            if k is not None and _is_str_const(k) and _is_secret_name(k.value) and _secret_literal(v):
                 self.report("하드코딩된 중요정보", v, single_line=True)
         self.generic_visit(node)
 
@@ -828,13 +838,13 @@ class SecurityVisitor(ast.NodeVisitor):
 
         # 함수 키워드 인자로 하드코딩된 비밀값: connect(passwd='1234')
         for k in node.keywords:
-            if k.arg and SECRET_NAME.search(k.arg) and _secret_literal(k.value):
+            if k.arg and _is_secret_name(k.arg) and _secret_literal(k.value):
                 self.report("하드코딩된 중요정보", k.value, single_line=True)
 
         # 환경변수 기본값으로 하드코딩된 비밀값: os.environ.get("ADMIN_PASSWORD", "admin1234")
         if name in ENV_GET_FUNCS and _is_str_const(first):
             default = args[1] if len(args) > 1 else kw.get("default")
-            secret_named = SECRET_NAME.search(first.value) or any(SECRET_NAME.search(n) for n in self.assign_names)
+            secret_named = _is_secret_name(first.value) or any(_is_secret_name(n) for n in self.assign_names)
             if secret_named and _secret_literal(default):
                 self.report("하드코딩된 중요정보", node,
                             f"환경변수 {first.value} 가 없으면 소스에 적힌 기본값이 그대로 비밀번호/키로 사용됩니다.")
@@ -845,7 +855,7 @@ class SecurityVisitor(ast.NodeVisitor):
             and "log" in _raw_name(node.func.value).lower())
         if is_log:
             leaked = sorted({n for a in list(args) + [k.value for k in node.keywords]
-                             for n in _output_names(a) if SECRET_NAME.search(n)})
+                             for n in _output_names(a) if _is_secret_name(n)})
             if leaked:
                 self.report("중요정보 노출(로그/출력)", node, f"출력되는 값: {', '.join(leaked)}")
 
