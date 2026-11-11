@@ -1,4 +1,5 @@
 import ast
+import builtins
 import csv
 import io
 import re
@@ -53,10 +54,23 @@ GUIDES = {
     "디버그 모드 활성화": "[KISA 보안 가이드 6-2] DEBUG 모드로 배포하면 내부 정보가 노출됩니다. 운영 환경에서는 DEBUG=False로 설정하세요.",
 }
 
-SQL_EXEC_FUNCS = {"execute", "executemany", "executescript", "raw"}
+SQL_EXEC_FUNCS = {"execute", "executemany", "executescript", "raw", "read_sql", "read_sql_query"}
 # 외부 입력으로 간주하는 request 속성 (request.method 등은 제외)
 REQUEST_ATTRS = {"GET", "POST", "FILES", "COOKIES", "META", "body", "data", "form", "args", "values",
-                 "json", "get_json", "files", "cookies", "headers", "query_params"}
+                 "json", "get_json", "files", "cookies", "headers", "query_params", "path_params"}
+# 웹 프레임워크 경로 함수: @app.get("/x"), @router.post(...), @app.route("/<name>") 의 매개변수 = 외부 입력
+ROUTE_DECORATORS = {"get", "post", "put", "delete", "patch", "head", "options", "route", "api_route",
+                    "websocket", "api_view"}
+DEPENDENCY_FUNCS = {"Depends", "Security"}   # FastAPI 의존성 주입 값은 서버가 만든 값
+SAFE_PARAM_TYPES = {"Request", "WebSocket", "HTTPConnection", "Session", "AsyncSession",
+                    "BackgroundTasks", "Response"}
+# Streamlit 사용자 입력 위젯 (st.query_params 도 외부 입력)
+STREAMLIT_INPUTS = {"text_input", "text_area", "number_input", "chat_input", "file_uploader",
+                    "camera_input", "audio_input", "data_editor"}
+# 외부 입력이 이 함수들을 거쳐도 여전히 외부 입력 (그 밖의 함수를 거친 값은 가공된 값으로 보고 추적 중단)
+TAINT_PASSTHROUGH = ("os.path.", "pathlib.", "posixpath.", "ntpath.", "urllib.parse.", "base64.",
+                     "binascii.", "json.", "codecs.", "textwrap.", "string.", "html.unescape", "shlex.split")
+BUILTIN_NAMES = set(dir(builtins))
 # 반환값을 '검증/치환된 값'으로 보는 함수
 SANITIZERS = {"escape", "escape_filter_chars", "escape_dn_chars", "basename", "secure_filename", "quote", "clean"}
 GUARD_METHODS = {"isalnum", "isalpha", "isdigit", "isdecimal", "isnumeric", "isidentifier"}
@@ -67,7 +81,8 @@ PATH_FUNCS = {"io.open", "codecs.open", "os.open", "os.remove", "os.unlink", "os
               "shutil.rmtree", "shutil.copy", "shutil.copyfile", "shutil.move", "flask.send_file"}
 SSRF_FUNCS = {"requests.get", "requests.post", "requests.put", "requests.delete", "requests.head",
               "requests.patch", "requests.options", "urllib.request.urlopen", "httpx.get", "httpx.post"}
-REDIRECT_FUNCS = {"redirect", "HttpResponseRedirect", "HttpResponsePermanentRedirect"}
+PATH_SINK_SHORT = {"FileResponse", "send_file"}   # FastAPI/Starlette FileResponse, Flask send_file
+REDIRECT_FUNCS = {"redirect", "HttpResponseRedirect", "HttpResponsePermanentRedirect", "RedirectResponse"}
 DESER_FUNCS = {"pickle.load", "pickle.loads", "pickle.Unpickler", "cPickle.load", "cPickle.loads",
                "dill.load", "dill.loads", "marshal.load", "marshal.loads", "jsonpickle.decode"}
 SAFE_YAML_LOADERS = {"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"}
@@ -211,6 +226,8 @@ class SecurityVisitor(ast.NodeVisitor):
         self.aliases = {}        # import 별칭: Popen -> subprocess.Popen, np -> numpy
         self.func_stack = []     # 현재 함수 이름 (난수 사용 문맥 판단용)
         self.assign_names = set()
+        self.local_funcs = set()   # 이 파일에서 정의한 함수 이름 (내장 함수와 구분)
+        self.dep_aliases = set()   # DbSession = Annotated[Session, Depends(get_db)] 같은 의존성 타입 별칭
         self._reset_scope()
 
     # ---------- 스코프 (함수 단위로 변수 상태를 분리) ----------
@@ -288,6 +305,15 @@ class SecurityVisitor(ast.NodeVisitor):
             return True
         return False
 
+    def _uses_streamlit(self):
+        return "streamlit" in self.aliases.values()
+
+    def _is_passthrough(self, func, name):
+        """외부 입력을 가공 없이 그대로 전달하는 함수인가 (str(), os.path.join, Path ...)"""
+        if isinstance(func, ast.Name) and func.id not in self.aliases and func.id not in self.local_funcs:
+            return func.id in BUILTIN_NAMES
+        return name.startswith(TAINT_PASSTHROUGH)
+
     def _tainted(self, node):
         """외부 입력에서 온 (검증되지 않은) 값인가"""
         if node is None:
@@ -297,11 +323,23 @@ class SecurityVisitor(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             if self._is_sanitizer_call(node):
                 return False
+            name = self._call_name(node.func)
             if isinstance(node.func, ast.Name) and node.func.id == "input":
                 return True
-            return any(self._tainted(c) for c in ast.iter_child_nodes(node))
+            if self._uses_streamlit() and name.split(".")[-1] in STREAMLIT_INPUTS:   # st.text_input(...)
+                return True
+            if isinstance(node.func, ast.Attribute):
+                if self._tainted(node.func):            # 외부입력.get() / request.get_json()
+                    return True
+                if not _is_str_const(node.func.value) and not self._is_passthrough(node.func, name):
+                    return False                        # db.get(User, uid) 처럼 가공된 결과
+            elif not self._is_passthrough(node.func, name):
+                return False                            # 검증 함수 등 내부 동작을 알 수 없는 함수의 결과
+            return (any(self._tainted(a) for a in node.args)
+                    or any(self._tainted(k.value) for k in node.keywords))
         if isinstance(node, ast.Attribute):
-            if self._is_request(node) or self._call_name(node) == "sys.argv":
+            name = self._call_name(node)
+            if self._is_request(node) or name == "sys.argv" or name.startswith("streamlit.query_params"):
                 return True
             return self._tainted(node.value)
         return any(self._tainted(c) for c in ast.iter_child_nodes(node))
@@ -358,14 +396,53 @@ class SecurityVisitor(ast.NodeVisitor):
             target = d.func if isinstance(d, ast.Call) else d
             if self._call_name(target).split(".")[-1] == "csrf_exempt":
                 self.report("크로스사이트 요청 위조(CSRF)", d, single_line=True)
+        self.local_funcs.add(node.name)
         saved = self._save_scope()
         self._reset_scope()
+        if self._is_route(node):
+            self.tainted |= self._route_params(node)
         self.func_stack.append(node.name)
         self.generic_visit(node)
         self.func_stack.pop()
         self._restore_scope(saved)
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def _is_route(self, node):
+        for d in node.decorator_list:
+            if isinstance(d, ast.Call) and self._call_name(d.func).split(".")[-1] in ROUTE_DECORATORS:
+                return True
+        return False
+
+    def _is_dependency(self, node):
+        """Depends(...) / Security(...) 이 들어 있거나, 그런 타입 별칭(DbSession 등)인가"""
+        if node is None:
+            return False
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and self._call_name(n.func).split(".")[-1] in DEPENDENCY_FUNCS:
+                return True
+            if isinstance(n, ast.Name) and n.id in self.dep_aliases:
+                return True
+        return False
+
+    def _route_params(self, node):
+        """경로 함수 매개변수 중 외부 입력인 것 (의존성 주입, Request/Session 객체는 제외)"""
+        a = node.args
+        positional = a.posonlyargs + a.args
+        defaults = [None] * (len(positional) - len(a.defaults)) + list(a.defaults)
+        pairs = list(zip(positional, defaults)) + list(zip(a.kwonlyargs, a.kw_defaults))
+        names = set()
+        for arg, default in pairs:
+            if arg.arg in ("self", "cls"):
+                continue
+            if self._is_dependency(arg.annotation) or self._is_dependency(default):
+                continue
+            ann_names = {_raw_name(n).split(".")[-1] for n in ast.walk(arg.annotation)
+                         if isinstance(n, (ast.Name, ast.Attribute))} if arg.annotation else set()
+            if ann_names & SAFE_PARAM_TYPES:
+                continue
+            names.add(arg.arg)
+        return names
 
     # ---------- if 문: 화이트리스트/isalnum/서명 검증 가드 ----------
     def _guard(self, test):
@@ -460,6 +537,8 @@ class SecurityVisitor(ast.NodeVisitor):
 
     def _assign(self, targets, value, node):
         self.assign_names = {n for t in targets for n in ([_target_key(t)] + _target_names(t)) if n}
+        if not self.func_stack and self._is_dependency(value):
+            self.dep_aliases |= {n for t in targets for n in _target_names(t)}
         self.visit(value)
         self.assign_names = set()
         tainted = self._tainted(value)
@@ -567,8 +646,9 @@ class SecurityVisitor(ast.NodeVisitor):
         builtin = isinstance(node.func, ast.Name) and node.func.id not in self.aliases
         first = args[0] if args else None
 
-        # SQL 인젝션: execute(동적 SQL) 또는 execute(위험 변수)
-        if short in SQL_EXEC_FUNCS and first is not None:
+        # SQL 인젝션: execute(동적 SQL) 또는 execute(위험 변수). SQLAlchemy text(...) 도 같은 방식으로 검사
+        is_sa_text = short == "text" and name.startswith("sqlalchemy")
+        if (short in SQL_EXEC_FUNCS or is_sa_text) and first is not None:
             if _is_dynamic_str(first) and self._has_sql_text(first):
                 self.report("SQL 인젝션", node)
             elif isinstance(first, ast.Name) and first.id in self.tainted_sql:
@@ -582,6 +662,8 @@ class SecurityVisitor(ast.NodeVisitor):
 
         # 경로 조작: 외부 입력값이 파일 경로로
         if ((builtin and name == "open") or name in PATH_FUNCS) and self._tainted(first):
+            self.report("경로 조작", node)
+        if short in PATH_SINK_SHORT and self._tainted(kw.get("path", first)):
             self.report("경로 조작", node)
 
         # 자원 삽입: 외부 입력값이 포트/주소로
@@ -650,6 +732,15 @@ class SecurityVisitor(ast.NodeVisitor):
 
         # XSS: 이스케이프 해제 함수에 동적 값
         if short in ("mark_safe", "Markup", "SafeString", "render_template_string") and \
+                first is not None and not self._is_clean(first):
+            self.report("크로스사이트 스크립트(XSS)", node)
+        # FastAPI HTMLResponse(외부입력) / Streamlit st.html(외부입력)
+        if (short == "HTMLResponse" or (name.startswith("streamlit") and short == "html")) and \
+                self._tainted(kw.get("content", first)):
+            self.report("크로스사이트 스크립트(XSS)", node)
+        # Streamlit st.markdown(동적 값, unsafe_allow_html=True)
+        unsafe_html = kw.get("unsafe_allow_html")
+        if isinstance(unsafe_html, ast.Constant) and unsafe_html.value is True and \
                 first is not None and not self._is_clean(first):
             self.report("크로스사이트 스크립트(XSS)", node)
 
@@ -790,7 +881,7 @@ def main():
 
     st.markdown("---")
 
-    tab_file, tab_folder = st.tabs(["📄 파일 검사", "📁 폴더 검사"])
+    tab_file, tab_folder = st.tabs(["파일 검사", "폴더 검사"])
     with tab_file:
         _single_file_tab()
     with tab_folder:
@@ -944,19 +1035,19 @@ def _render_folder_report(results):
 
         st.markdown("#### 파일별 상세 결과")
         for r in sorted(vulnerable, key=lambda r: (-len(r["findings"]), r["path"])):
-            with st.expander(f"📄 {r['path']} — {len(r['findings'])}건"):
+            with st.expander(f"{r['path']} — {len(r['findings'])}건"):
                 for idx, f in enumerate(r["findings"]):
                     if idx:
                         st.markdown("---")
                     _render_finding(f, in_expander=False)
 
     if failed:
-        with st.expander(f"⚠️ 분석 실패 파일 {len(failed)}개"):
+        with st.expander(f"분석 실패 파일 {len(failed)}개"):
             for r in failed:
                 st.markdown(f"- `{r['path']}` — {r['error']}")
 
     if clean:
-        with st.expander(f"✅ 취약점이 발견되지 않은 파일 {len(clean)}개"):
+        with st.expander(f"취약점이 발견되지 않은 파일 {len(clean)}개"):
             for r in clean:
                 st.markdown(f"- `{r['path']}`")
 
