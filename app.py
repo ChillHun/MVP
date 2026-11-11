@@ -1,4 +1,5 @@
 import ast
+import csv
 import io
 import re
 import textwrap
@@ -789,8 +790,33 @@ def main():
 
     st.markdown("---")
 
-    # 검사할 소스 파일 업로드 및 미리보기
-    uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"])
+    tab_file, tab_folder = st.tabs(["📄 파일 검사", "📁 폴더 검사"])
+    with tab_file:
+        _single_file_tab()
+    with tab_folder:
+        _folder_tab()
+
+
+def _render_finding(f, in_expander=True):
+    """탐지 결과 1건 출력. Streamlit 은 expander 중첩이 안 되므로 폴더 검사에서는 평문으로 출력."""
+    title = f"[취약점 발견] {f['rule']} (원본 코드 {f['line']}번째 줄)"
+    if in_expander:
+        with st.expander(title):
+            _render_finding_body(f)
+    else:
+        st.markdown(f"**{title}**")
+        _render_finding_body(f)
+
+
+def _render_finding_body(f):
+    st.code(f["code"], language="python")
+    if f["extra"]:
+        st.info(f["extra"])
+    st.error(f"조치 가이드: {f['guide']}")
+
+
+def _single_file_tab():
+    uploaded_file = st.file_uploader("검사할 파이썬(.py) 파일을 업로드하세요", type=["py"], key="single_file")
     if uploaded_file is None:
         st.info("검사할 소스 코드 파일을 업로드해 주세요.")
         return
@@ -799,8 +825,7 @@ def main():
     with st.expander("업로드한 코드 미리보기"):
         st.code(code_text, language="python")
 
-    # 스캔
-    if st.button("보안 취약점 스캔 시작"):
+    if st.button("보안 취약점 스캔 시작", key="scan_single"):
         st.write("---")
         st.subheader("스캔 결과 리포트")
 
@@ -810,16 +835,130 @@ def main():
             return
 
         for f in findings:
-            with st.expander(f"[취약점 발견] {f['rule']} (원본 코드 {f['line']}번째 줄)"):
-                st.code(f["code"], language="python")
-                if f["extra"]:
-                    st.info(f["extra"])
-                st.error(f"조치 가이드: {f['guide']}")
+            _render_finding(f)
 
         if not findings:
             st.success("안전: 업로드한 파일에서 주요 보안 취약점이 발견되지 않았습니다.")
         else:
             st.error(f"총 {len(findings)}개의 보안 취약점이 발견되었습니다. 조치 가이드에 따라 코드를 수정하세요.")
+
+
+# 폴더 검사 시 건너뛸 디렉터리 (가상환경, 캐시, 외부 라이브러리 등)
+SKIP_DIRS = {"venv", ".venv", "env", ".env", "__pycache__", "site-packages", "dist-packages",
+             ".git", "node_modules", ".idea", ".vscode", ".tox", ".mypy_cache", ".pytest_cache", "build", "dist"}
+
+
+def _is_skipped(path):
+    parts = path.replace("\\", "/").split("/")[:-1]   # 마지막은 파일명
+    return any(p in SKIP_DIRS for p in parts)
+
+
+def _scan_folder(files):
+    """반환: [{"path", "findings", "error"}, ...]"""
+    progress = st.progress(0.0, text="검사 준비 중...")
+    results = []
+    for i, uf in enumerate(files, 1):
+        progress.progress(i / len(files), text=f"{i} / {len(files)} 파일 검사 중: {uf.name}")
+        try:
+            findings, error = scan_source(_decode(uf.getvalue()))
+        except Exception as e:   # 스캐너 내부 오류가 나도 다른 파일 검사는 계속
+            findings, error = [], f"스캐너 내부 오류: {type(e).__name__}: {e}"
+        results.append({"path": uf.name, "findings": findings, "error": error})
+    progress.empty()
+    return results
+
+
+def _results_to_csv(results):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["파일", "줄", "취약점", "코드", "추가 정보", "조치 가이드"])
+    for r in results:
+        for f in r["findings"]:
+            writer.writerow([r["path"], f["line"], f["rule"], f["code"], f["extra"] or "", f["guide"]])
+    return buf.getvalue().encode("utf-8-sig")   # 엑셀에서 한글 깨짐 방지
+
+
+def _folder_tab():
+    uploaded = st.file_uploader(
+        "검사할 폴더를 선택하세요 (하위 폴더의 .py 파일까지 모두 검사)",
+        type=["py"], accept_multiple_files="directory", key="folder_files",
+    )
+    if not uploaded:
+        st.info("검사할 프로젝트 폴더를 업로드해 주세요.")
+        return
+
+    targets = sorted((f for f in uploaded if not _is_skipped(f.name)), key=lambda f: f.name)
+    skipped = len(uploaded) - len(targets)
+    msg = f"검사 대상 파이썬 파일 {len(targets)}개"
+    if skipped:
+        msg += f" (가상환경·캐시 등 {skipped}개 제외)"
+    st.write(msg)
+    if not targets:
+        st.warning("검사할 .py 파일이 없습니다.")
+        return
+
+    signature = tuple((f.name, f.size) for f in targets)
+    if st.button("폴더 전체 스캔 시작", key="scan_folder"):
+        st.session_state["folder_scan"] = {"signature": signature, "results": _scan_folder(targets)}
+
+    saved = st.session_state.get("folder_scan")
+    if not saved or saved["signature"] != signature:   # 업로드가 바뀌면 이전 결과는 숨김
+        return
+    _render_folder_report(saved["results"])
+
+
+def _render_folder_report(results):
+    st.write("---")
+    st.subheader("폴더 스캔 결과 리포트")
+
+    vulnerable = [r for r in results if r["findings"]]
+    failed = [r for r in results if r["error"]]
+    clean = [r for r in results if not r["findings"] and not r["error"]]
+    total = sum(len(r["findings"]) for r in results)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("검사한 파일", len(results))
+    c2.metric("취약 파일", len(vulnerable))
+    c3.metric("총 취약점", total)
+    c4.metric("분석 실패", len(failed))
+
+    if total == 0:
+        st.success("안전: 폴더 내 파일에서 주요 보안 취약점이 발견되지 않았습니다.")
+    else:
+        st.error(f"{len(vulnerable)}개 파일에서 총 {total}개의 보안 취약점이 발견되었습니다. 조치 가이드에 따라 코드를 수정하세요.")
+
+        counts = {}
+        for r in vulnerable:
+            for f in r["findings"]:
+                counts[f["rule"]] = counts.get(f["rule"], 0) + 1
+        st.markdown("#### 취약점 유형별 집계")
+        st.dataframe(
+            [{"취약점": k, "건수": v} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])],
+            hide_index=True, width="stretch",
+        )
+
+        st.download_button(
+            "결과 CSV 다운로드", data=_results_to_csv(results),
+            file_name="scan_report.csv", mime="text/csv",
+        )
+
+        st.markdown("#### 파일별 상세 결과")
+        for r in sorted(vulnerable, key=lambda r: (-len(r["findings"]), r["path"])):
+            with st.expander(f"📄 {r['path']} — {len(r['findings'])}건"):
+                for idx, f in enumerate(r["findings"]):
+                    if idx:
+                        st.markdown("---")
+                    _render_finding(f, in_expander=False)
+
+    if failed:
+        with st.expander(f"⚠️ 분석 실패 파일 {len(failed)}개"):
+            for r in failed:
+                st.markdown(f"- `{r['path']}` — {r['error']}")
+
+    if clean:
+        with st.expander(f"✅ 취약점이 발견되지 않은 파일 {len(clean)}개"):
+            for r in clean:
+                st.markdown(f"- `{r['path']}`")
 
 
 if __name__ == "__main__":   # streamlit run ast_scanner.py 로 실행할 때만 화면 표시
